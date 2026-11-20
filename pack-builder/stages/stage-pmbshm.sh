@@ -20,7 +20,8 @@ strip --strip-unneeded "$out/libpmbshm.so"
 
 exports="$(readelf --dyn-syms -W "$out/libpmbshm.so" \
     | awk '$5 == "GLOBAL" && $7 != "UND" {print $8}' | sed 's/@.*//' | sort | tr '\n' ' ')"
-[ "$exports" = "shmat shmctl shmdt shmget " ] || die "unexpected exported symbols: $exports"
+# shm* = SysV emulation; mmap/mmap64/mprotect = W^X fallback (see pmbshm.c)
+[ "$exports" = "mmap mmap64 mprotect shmat shmctl shmdt shmget " ] || die "unexpected exported symbols: $exports"
 
 log "compiling self-test"
 gcc -std=gnu11 -O1 -Wall -Wextra -Werror -o "$out/pmbshm-test" "$PB/src/pmbshm-test.c" -lpthread
