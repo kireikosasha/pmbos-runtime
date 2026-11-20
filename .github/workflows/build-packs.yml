@@ -38,6 +38,11 @@ on:
         description: "Build and verify only, publish nothing (packs stay in the pb-dist artifact)"
         type: boolean
         default: false
+      reuse_run:
+        description: "Run id of an earlier run whose box64/wine stage artifacts are reused instead of rebuilding (empty: build)"
+        type: string
+        required: false
+        default: ""
       verify_wine:
         description: "Stage verify, wine --version under box64: auto = warn on failure, 1 = must pass, 0 = skip"
         type: choice
@@ -48,6 +53,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: build-packs
@@ -238,35 +244,55 @@ jobs:
       BOX64_VARIANTS: ${{ needs.plan.outputs.box64_variants }}
     steps:
       - uses: actions/checkout@v4
+      - name: Reuse stage artifact from an earlier run
+        id: reuse
+        if: inputs.reuse_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN: ${{ inputs.reuse_run }}
+        run: |
+          mkdir -p artifacts
+          if gh run download "$REUSE_RUN" -R "${{ github.repository }}" -n "pb-stage-box64" -D artifacts && ls artifacts/*.tar.zst >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"; echo "reused pb-stage-box64 from run $REUSE_RUN"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"; echo "no reusable artifact, building"
+          fi
       - name: Free disk space
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" free-disk
       - name: Restore build image (arm64)
+        if: steps.reuse.outputs.hit != 'true'
         id: img-arm64
         uses: actions/cache/restore@v4
         with:
           path: images/arm64.tar.zst
           key: pb-img-v1-${{ runner.arch }}-arm64-${{ hashFiles('pack-builder/docker/Dockerfile.arm64', 'pack-builder/versions.env') }}
       - name: Load build images
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" images-load images
       - uses: actions/download-artifact@v4
+        if: steps.reuse.outputs.hit != 'true'
         with:
           name: pb-src
           path: artifacts
       - name: Unpack sources
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" restore
       - name: Stage box64
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$BUILD_ALL" -w "$PB_WORK" -s box64
       - name: Export build image (arm64)
         id: save-arm64
-        if: always() && steps.img-arm64.outputs.cache-hit != 'true'
+        if: always() && steps.img-arm64.outputs.cache-hit != 'true' && steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" images-save images arm64
       - name: Cache build image (arm64)
-        if: always() && steps.save-arm64.outputs.saved == 'true'
+        if: always() && steps.save-arm64.outputs.saved == 'true' && steps.reuse.outputs.hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: images/arm64.tar.zst
           key: ${{ steps.img-arm64.outputs.cache-primary-key }}
       - name: Pack results
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" save pb-stage-box64 'stage/box64' 'stage/box64.pack.json' 'stage/box64-*'
       - uses: actions/upload-artifact@v4
         with:
@@ -350,35 +376,55 @@ jobs:
       WINE_BUILD_VERSIONS: ${{ matrix.wine }}
     steps:
       - uses: actions/checkout@v4
+      - name: Reuse stage artifact from an earlier run
+        id: reuse
+        if: inputs.reuse_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN: ${{ inputs.reuse_run }}
+        run: |
+          mkdir -p artifacts
+          if gh run download "$REUSE_RUN" -R "${{ github.repository }}" -n "pb-stage-wine-${{ matrix.wine }}" -D artifacts && ls artifacts/*.tar.zst >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"; echo "reused pb-stage-wine-${{ matrix.wine }} from run $REUSE_RUN"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"; echo "no reusable artifact, building"
+          fi
       - name: Free disk space
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" free-disk
       - name: Restore build image (amd64)
+        if: steps.reuse.outputs.hit != 'true'
         id: img-amd64
         uses: actions/cache/restore@v4
         with:
           path: images/amd64.tar.zst
           key: pb-img-v1-${{ runner.arch }}-amd64-${{ hashFiles('pack-builder/docker/Dockerfile.amd64', 'pack-builder/versions.env') }}
       - name: Load build images
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" images-load images
       - uses: actions/download-artifact@v4
+        if: steps.reuse.outputs.hit != 'true'
         with:
           name: pb-src
           path: artifacts
       - name: Unpack sources
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" restore
       - name: Stage wine
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$BUILD_ALL" -w "$PB_WORK" -s wine
       - name: Export build image (amd64)
         id: save-amd64
-        if: always() && steps.img-amd64.outputs.cache-hit != 'true'
+        if: always() && steps.img-amd64.outputs.cache-hit != 'true' && steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" images-save images amd64
       - name: Cache build image (amd64)
-        if: always() && steps.save-amd64.outputs.saved == 'true'
+        if: always() && steps.save-amd64.outputs.saved == 'true' && steps.reuse.outputs.hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: images/amd64.tar.zst
           key: ${{ steps.img-amd64.outputs.cache-primary-key }}
       - name: Pack results
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" save "pb-stage-wine-$WINE_BUILD_VERSIONS" "stage/wine-$WINE_BUILD_VERSIONS" "stage/wine-$WINE_BUILD_VERSIONS.pack.json"
       - uses: actions/upload-artifact@v4
         with:
