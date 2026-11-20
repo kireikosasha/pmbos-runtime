@@ -1,0 +1,383 @@
+PMB OS patch: glibc system paths relative to $PMBOS_ROOTFS (no chroot/proot needed)
+Upstream: glibc 2.36 as shipped by Debian bookworm (source package glibc 2.36-9+deb12uN,
+          checked against 2.36-9+deb12u14, i.e. after Debian's own quilt series)
+          https://deb.debian.org/debian/pool/main/g/glibc/glibc_2.36-9+deb12u14.dsc
+          (also applies to the plain https://ftp.gnu.org/gnu/glibc/glibc-2.36.tar.xz)
+Apply:    patch -p1 --fuzz=0 < glibc-2.36-pmbos-rootfs.patch   (stages/stage-glibc.sh)
+
+Why: PMB OS runs this glibc from an unpacked tree (imagefs) inside the Android app's data
+directory. Android has no /etc/resolv.conf, /etc/hosts, /etc/nsswitch.conf, /etc/services,
+/etc/protocols, /etc/passwd, /etc/group, /etc/localtime and no /bin/sh, and libc opens these
+itself by absolute path - internal calls that LD_PRELOAD cannot interpose. Result without the
+patch: DNS fails (getaddrinfo/res_init), user/service lookups fail, system()/popen() fail.
+
+What: one internal header, include/pmbos-rootfs.h, with __pmbos_rootfs_path (PATH, BUF,
+SIZE): when PMBOS_ROOTFS is set (secure_getenv semantics: ignored for AT_SECURE) to an
+absolute path other than "/", returns "$PMBOS_ROOTFS" + PATH in BUF (PATH_MAX bytes on the
+caller's stack); otherwise - or if the result would not fit - returns PATH unchanged. There is
+no "exists?" fallback while the variable is set (deterministic, no TOCTOU between change
+detection and open, the host's /system/etc/hosts is never mixed in). Unset -> byte-for-byte
+upstream behaviour. Call sites (all in libc.so.6; nss_files/nss_dns are built into libc since
+2.34, so libnss_files.so.2/libresolv.so.2 need no change):
+
+  nss/nss_files_fopen.c    __nss_files_fopen: every nss_files database - /etc/passwd, group,
+                           shadow, gshadow, hosts, services, protocols, networks, ethers, rpc,
+                           netgroup, aliases (+ initgroups, nss_compat)
+  nss/nss_database.c       nss_database_reload (fopen) and nss_database_check_reload_and_get
+                           (change detection) of _PATH_NSSWITCH_CONF (/etc/nsswitch.conf)
+  resolv/res_init.c        __resolv_conf_load: fopen (_PATH_RESCONF) (/etc/resolv.conf)
+  resolv/resolv_conf.c     __resolv_conf_get_current: change detection of _PATH_RESCONF
+  resolv/res_hconf.c       do_init: default _PATH_HOSTCONF (/etc/host.conf; RESOLV_HOST_CONF
+                           still overrides it)
+  sysdeps/posix/getaddrinfo.c  gaiconf_init (fopen) / gaiconf_reload (stat) of /etc/gai.conf
+  time/tzfile.c            __tzfile_read: TZDEFAULT (/etc/localtime, TZ unset or equal to it)
+                           and the default TZDIR (/usr/share/zoneinfo) for relative TZ names
+                           (an explicit $TZDIR still wins)
+  sysdeps/posix/system.c   do_system: posix_spawn path of SHELL_PATH (/bin/sh), argv[0] "sh"
+  libio/iopopen.c          spawn_process: popen's _PATH_BSHELL
+  posix/wordexp.c          exec_comm_child: command substitution shell (argv[0] + spawn path)
+  posix/execvpe.c          maybe_script_execute: execvp/execvpe ENOEXEC fallback to /bin/sh
+
+Not patched (on purpose): sysdeps/unix/sysv/linux/spawni.c maybe_script_execute only exists
+for GLIBC_2.2..2.15 compat symbols (SHLIB_COMPAT is false on aarch64, the oldest ABI is
+GLIBC_2.17); getusershell (/etc/shells); ld.so (/etc/ld.so.cache, /etc/ld.so.preload - the
+launcher sets LD_LIBRARY_PATH); gconv/locale dirs (GCONV_PATH, LANG=C.UTF-8 in the env
+contract); nscd. The PMB OS launcher exports PMBOS_ROOTFS=<abs imagefs, no trailing slash>
+to every process (pmbos/docs/subsystems/packbuilder.md, "Required environment").
+
+--- /dev/null
++++ b/include/pmbos-rootfs.h
+@@ -0,0 +1,49 @@
++/* PMB OS: relocate glibc's fixed system paths into $PMBOS_ROOTFS.
++
++   PMB OS runs this glibc from an unpacked directory tree ("imagefs") inside
++   an Android app's data directory, without chroot/proot.  Android has no
++   /etc/resolv.conf, /etc/hosts, /etc/nsswitch.conf, /etc/passwd, ... and no
++   /bin/sh, and libc opens these by absolute path internally (not
++   interposable with LD_PRELOAD).  The launcher exports
++   PMBOS_ROOTFS=<absolute imagefs path> to every process; the few libc call
++   sites that open such a path pass it through __pmbos_rootfs_path first.
++
++   Semantics: if PMBOS_ROOTFS is set (ignored in AT_SECURE processes, like
++   every secure_getenv variable), starts with '/', is not "/" and
++   "$PMBOS_ROOTFS" + PATH (trailing slashes of the variable stripped) fits
++   into BUF, the joined path is returned in BUF; otherwise PATH itself is
++   returned unchanged.  There is no existence fallback: with PMBOS_ROOTFS
++   set, only the rootfs copy is consulted.  With the variable unset this
++   glibc behaves exactly like the unpatched one.  No allocation, no locks
++   (getenv, strlen and memcpy only).  */
++
++#ifndef _PMBOS_ROOTFS_H
++#define _PMBOS_ROOTFS_H 1
++
++#include <limits.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* Size of the caller-provided buffers.  */
++#define PMBOS_ROOTFS_BUFSIZE PATH_MAX
++
++static inline const char *
++__pmbos_rootfs_path (const char *path, char *buf, size_t size)
++{
++  const char *root = __libc_secure_getenv ("PMBOS_ROOTFS");
++  if (root == NULL || root[0] != '/' || path == NULL || path[0] != '/')
++    return path;
++  size_t rlen = strlen (root);
++  while (rlen > 0 && root[rlen - 1] == '/')
++    --rlen;
++  if (rlen == 0)
++    return path;
++  size_t plen = strlen (path) + 1;
++  if (rlen + plen > size)
++    return path;
++  memcpy (buf, root, rlen);
++  memcpy (buf + rlen, path, plen);
++  return buf;
++}
++
++#endif /* pmbos-rootfs.h */
+--- a/libio/iopopen.c
++++ b/libio/iopopen.c
+@@ -35,6 +35,7 @@
+ #include <sys/wait.h>
+ #include <spawn.h>
+ #include <paths.h>
++#include <pmbos-rootfs.h>
+ 
+ struct _IO_proc_file
+ {
+@@ -84,7 +85,10 @@
+ 	return false;
+     }
+ 
+-  if (__posix_spawn (&((_IO_proc_file *) fp)->pid, _PATH_BSHELL, fa, 0,
++  char pmbos_buf[PMBOS_ROOTFS_BUFSIZE];
++  if (__posix_spawn (&((_IO_proc_file *) fp)->pid,
++		     __pmbos_rootfs_path (_PATH_BSHELL, pmbos_buf,
++					  sizeof pmbos_buf), fa, 0,
+ 		     (char *const[]){ (char*) "sh", (char*) "-c",
+ 		     (char *) command, NULL }, __environ) != 0)
+     return false;
+--- a/nss/nss_database.c
++++ b/nss/nss_database.c
+@@ -28,6 +28,7 @@
+ #include <netdb.h>
+ #include <stdio_ext.h>
+ #include <string.h>
++#include <pmbos-rootfs.h>
+ 
+ struct nss_database_state
+ {
+@@ -303,7 +304,9 @@
+ nss_database_reload (struct nss_database_data *staging,
+                      struct file_change_detection *initial)
+ {
+-  FILE *fp = fopen (_PATH_NSSWITCH_CONF, "rce");
++  char pmbos_buf[PMBOS_ROOTFS_BUFSIZE];
++  FILE *fp = fopen (__pmbos_rootfs_path (_PATH_NSSWITCH_CONF, pmbos_buf,
++                                         sizeof pmbos_buf), "rce");
+   if (fp == NULL)
+     switch (errno)
+       {
+@@ -407,7 +410,10 @@
+     }
+ 
+   struct file_change_detection initial;
+-  if (!__file_change_detection_for_path (&initial, _PATH_NSSWITCH_CONF))
++  char pmbos_buf[PMBOS_ROOTFS_BUFSIZE];
++  if (!__file_change_detection_for_path
++      (&initial, __pmbos_rootfs_path (_PATH_NSSWITCH_CONF, pmbos_buf,
++                                      sizeof pmbos_buf)))
+     return false;
+ 
+   __libc_lock_lock (local->lock);
+--- a/nss/nss_files_fopen.c
++++ b/nss/nss_files_fopen.c
+@@ -20,11 +20,14 @@
+ 
+ #include <errno.h>
+ #include <stdio_ext.h>
++#include <pmbos-rootfs.h>
+ 
+ FILE *
+ __nss_files_fopen (const char *path)
+ {
+-  FILE *fp = fopen (path, "rce");
++  char pmbos_buf[PMBOS_ROOTFS_BUFSIZE];
++  FILE *fp = fopen (__pmbos_rootfs_path (path, pmbos_buf, sizeof pmbos_buf),
++                    "rce");
+   if (fp == NULL)
+     return NULL;
+ 
+--- a/posix/execvpe.c
++++ b/posix/execvpe.c
+@@ -24,6 +24,7 @@
+ #include <paths.h>
+ #include <confstr.h>
+ #include <sys/param.h>
++#include <pmbos-rootfs.h>
+ 
+ #ifndef PATH_MAX
+ # ifdef MAXPATHLEN
+@@ -56,7 +57,9 @@
+ 	will also skip the script name in arguments and only copy script
+ 	arguments.  */
+   char *new_argv[argc > 1 ? 2 + argc : 3];
+-  new_argv[0] = (char *) _PATH_BSHELL;
++  char pmbos_buf[PMBOS_ROOTFS_BUFSIZE];
++  new_argv[0] = (char *) __pmbos_rootfs_path (_PATH_BSHELL, pmbos_buf,
++					      sizeof pmbos_buf);
+   new_argv[1] = (char *) file;
+   if (argc > 1)
+     memcpy (new_argv + 2, argv + 1, argc * sizeof (char *));
+--- a/posix/wordexp.c
++++ b/posix/wordexp.c
+@@ -35,6 +35,7 @@
+ #include <scratch_buffer.h>
+ #include <_itoa.h>
+ #include <assert.h>
++#include <pmbos-rootfs.h>
+ 
+ /*
+  * This is a recursive-descent-style word expansion routine.
+@@ -810,7 +811,10 @@
+   pid_t pid = -1;
+ 
+   /* Execute the command, or just check syntax?  */
+-  const char *args[] = { _PATH_BSHELL, noexec ? "-nc" : "-c", comm, NULL };
++  char pmbos_buf[PMBOS_ROOTFS_BUFSIZE];
++  const char *shell = __pmbos_rootfs_path (_PATH_BSHELL, pmbos_buf,
++					   sizeof pmbos_buf);
++  const char *args[] = { shell, noexec ? "-nc" : "-c", comm, NULL };
+ 
+   posix_spawn_file_actions_t fa;
+   /* posix_spawn_file_actions_init does not fail.  */
+@@ -857,7 +861,7 @@
+ 
+   /* pid is not set if posix_spawn fails, so it keep the original value
+      of -1.  */
+-  __posix_spawn (&pid, _PATH_BSHELL, &fa, NULL, (char *const *) args,
++  __posix_spawn (&pid, shell, &fa, NULL, (char *const *) args,
+ 		 recreate_env ? strlist_begin (&newenv) : __environ);
+ 
+   strlist_free (&newenv);
+--- a/resolv/res_hconf.c
++++ b/resolv/res_hconf.c
+@@ -42,6 +42,7 @@
+ #include "res_hconf.h"
+ #include <wchar.h>
+ #include <atomic.h>
++#include <pmbos-rootfs.h>
+ 
+ #if IS_IN (libc)
+ # define fgets_unlocked __fgets_unlocked
+@@ -269,13 +270,15 @@
+   const char *hconf_name;
+   int line_num = 0;
+   char buf[256], *envval;
++  char pmbos_buf[PMBOS_ROOTFS_BUFSIZE];
+   FILE *fp;
+ 
+   memset (&_res_hconf, '\0', sizeof (_res_hconf));
+ 
+   hconf_name = getenv (ENV_HOSTCONF);
+   if (hconf_name == NULL)
+-    hconf_name = _PATH_HOSTCONF;
++    hconf_name = __pmbos_rootfs_path (_PATH_HOSTCONF, pmbos_buf,
++                                      sizeof pmbos_buf);
+ 
+   fp = fopen (hconf_name, "rce");
+   if (fp)
+--- a/resolv/res_init.c
++++ b/resolv/res_init.c
+@@ -104,6 +104,7 @@
+ #include <errno.h>
+ #include <resolv_conf.h>
+ #include <file_change_detection.h>
++#include <pmbos-rootfs.h>
+ 
+ static uint32_t net_mask (struct in_addr);
+ 
+@@ -556,7 +557,9 @@
+   /* Ensure that /etc/hosts.conf has been loaded (once).  */
+   _res_hconf_init ();
+ 
+-  FILE *fp = fopen (_PATH_RESCONF, "rce");
++  char pmbos_buf[PMBOS_ROOTFS_BUFSIZE];
++  FILE *fp = fopen (__pmbos_rootfs_path (_PATH_RESCONF, pmbos_buf,
++                                         sizeof pmbos_buf), "rce");
+   if (fp == NULL)
+     switch (errno)
+       {
+--- a/resolv/resolv_conf.c
++++ b/resolv/resolv_conf.c
+@@ -25,6 +25,7 @@
+ #include <sys/stat.h>
+ #include <libc-symbols.h>
+ #include <file_change_detection.h>
++#include <pmbos-rootfs.h>
+ 
+ /* _res._u._ext.__glibc_extension_index is used as an index into a
+    struct resolv_conf_array object.  The intent of this construction
+@@ -121,7 +122,10 @@
+ __resolv_conf_get_current (void)
+ {
+   struct file_change_detection initial;
+-  if (!__file_change_detection_for_path (&initial, _PATH_RESCONF))
++  char pmbos_buf[PMBOS_ROOTFS_BUFSIZE];
++  if (!__file_change_detection_for_path
++      (&initial, __pmbos_rootfs_path (_PATH_RESCONF, pmbos_buf,
++                                      sizeof pmbos_buf)))
+     return NULL;
+ 
+   struct resolv_conf_global *global_copy = get_locked_global ();
+--- a/sysdeps/posix/getaddrinfo.c
++++ b/sysdeps/posix/getaddrinfo.c
+@@ -83,6 +83,7 @@
+ #include <nscd/nscd_proto.h>
+ #include <scratch_buffer.h>
+ #include <inet/net-internal.h>
++#include <pmbos-rootfs.h>
+ 
+ /* Former AI_IDN_ALLOW_UNASSIGNED and AI_IDN_USE_STD3_ASCII_RULES
+    flags, now ignored.  */
+@@ -1932,7 +1933,9 @@
+   size_t nscopelist = 0;
+   bool scopelist_nullbits = false;
+ 
+-  FILE *fp = fopen (GAICONF_FNAME, "rce");
++  char pmbos_buf[PMBOS_ROOTFS_BUFSIZE];
++  FILE *fp = fopen (__pmbos_rootfs_path (GAICONF_FNAME, pmbos_buf,
++                                         sizeof pmbos_buf), "rce");
+   if (fp == NULL)
+     goto no_file;
+ 
+@@ -2248,7 +2251,9 @@
+ gaiconf_reload (void)
+ {
+   struct __stat64_t64 st;
+-  if (__stat64_time64 (GAICONF_FNAME, &st) != 0
++  char pmbos_buf[PMBOS_ROOTFS_BUFSIZE];
++  if (__stat64_time64 (__pmbos_rootfs_path (GAICONF_FNAME, pmbos_buf,
++                                            sizeof pmbos_buf), &st) != 0
+       || !check_gaiconf_mtime (&st))
+     gaiconf_init ();
+ }
+--- a/sysdeps/posix/system.c
++++ b/sysdeps/posix/system.c
+@@ -30,6 +30,7 @@
+ #include <not-errno.h>
+ #include <not-cancel.h>
+ #include <internal-signals.h>
++#include <pmbos-rootfs.h>
+ 
+ #define	SHELL_PATH	"/bin/sh"	/* Path of the shell.  */
+ #define	SHELL_NAME	"sh"		/* Name to give it.  */
+@@ -144,7 +145,11 @@
+   __posix_spawnattr_setflags (&spawn_attr,
+ 			      POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK);
+ 
+-  ret = __posix_spawn (&pid, SHELL_PATH, 0, &spawn_attr,
++  char pmbos_buf[PMBOS_ROOTFS_BUFSIZE];
++  ret = __posix_spawn (&pid,
++		       __pmbos_rootfs_path (SHELL_PATH, pmbos_buf,
++					    sizeof pmbos_buf),
++		       0, &spawn_attr,
+ 		       (char *const[]){ (char *) SHELL_NAME,
+ 					(char *) "-c",
+ 					(char *) line, NULL },
+--- a/time/tzfile.c
++++ b/time/tzfile.c
+@@ -28,6 +28,7 @@
+ #include <alloc_buffer.h>
+ 
+ #include <timezone/tzfile.h>
++#include <pmbos-rootfs.h>
+ 
+ int __use_tzfile;
+ static dev_t tzfile_dev;
+@@ -113,6 +114,7 @@
+   int was_using_tzfile = __use_tzfile;
+   int trans_width = 4;
+   char *new = NULL;
++  char pmbos_buf[PMBOS_ROOTFS_BUFSIZE];
+ 
+   _Static_assert (sizeof (__time64_t) == 8,
+ 		  "__time64_t must be eight bytes");
+@@ -147,11 +149,14 @@
+ 
+       tzdir = getenv ("TZDIR");
+       if (tzdir == NULL || *tzdir == '\0')
+-	tzdir = default_tzdir;
++	tzdir = __pmbos_rootfs_path (default_tzdir, pmbos_buf,
++				     sizeof pmbos_buf);
+       if (__asprintf (&new, "%s/%s", tzdir, file) == -1)
+ 	goto ret_free_transitions;
+       file = new;
+     }
++  else if (strcmp (file, TZDEFAULT) == 0)
++    file = __pmbos_rootfs_path (file, pmbos_buf, sizeof pmbos_buf);
+ 
+   /* If we were already using tzfile, check whether the file changed.  */
+   struct __stat64_t64 st;

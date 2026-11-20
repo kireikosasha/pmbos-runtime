@@ -1,0 +1,16 @@
+# Host-architecture helper image: downloads, mmdebstrap (extract variant, foreign arch
+# without emulation), patchelf, packing (tar/xz) and the repo index.
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+FROM ${DEBIAN_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8 LANG=C.UTF-8
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl git tar xz-utils zstd gzip file patch \
+      python3 patchelf binutils \
+      mmdebstrap debian-archive-keyring apt dpkg \
+ && rm -rf /var/lib/apt/lists/*
+
+# /work is owned by the host user while stages run as root
+RUN git config --system --add safe.directory '*'

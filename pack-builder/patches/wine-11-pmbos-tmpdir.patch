@@ -1,0 +1,43 @@
+PMB OS patch: wineserver socket directory honours $PMBOS_TMPDIR
+Upstream: Wine 11.0 (https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz),
+          also verified to apply to Wine 11.22 (hunk offset only).
+Apply:    patch -p1 --fuzz=0 < wine-11-pmbos-tmpdir.patch
+
+Why: wineserver and ntdll rendezvous in /tmp/.wine-<uid>/server-<dev>-<ino>/. A glibc
+userland on Android has no /tmp (and no proot/chroot is used), so the directory base is
+taken from $PMBOS_TMPDIR (absolute path; the PMB OS launcher sets <imagefs>/tmp) and falls
+back to /tmp when unset, i.e. behaviour on a normal Linux host is unchanged.
+Both sides (server/request.c and dlls/ntdll/unix/server.c) MUST compute the same path.
+
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1308,7 +1308,10 @@
+ #ifdef __ANDROID__  /* there's no /tmp dir on Android */
+     asprintf( &dir, "%s/.wineserver/server-%llx-%llx", config_dir, (unsigned long long)dev, (unsigned long long)ino );
+ #else
+-    asprintf( &dir, "/tmp/.wine-%u/server-%llx-%llx", getuid(), (unsigned long long)dev, (unsigned long long)ino );
++    /* PMB OS: hosts without a usable /tmp (Android) export PMBOS_TMPDIR; must match wineserver */
++    const char *tmp_dir = getenv( "PMBOS_TMPDIR" );
++    if (!tmp_dir || tmp_dir[0] != '/') tmp_dir = "/tmp";
++    asprintf( &dir, "%s/.wine-%u/server-%llx-%llx", tmp_dir, getuid(), (unsigned long long)dev, (unsigned long long)ino );
+ #endif
+     return dir;
+ }
+--- a/server/request.c
++++ b/server/request.c
+@@ -644,8 +644,13 @@
+     if (asprintf( &base_dir, "%s/.wineserver", config_dir ) == -1)
+         fatal_error( "out of memory\n" );
+ #else
+-    if (asprintf( &base_dir, "/tmp/.wine-%u", getuid() ) == -1)
+-        fatal_error( "out of memory\n" );
++    {
++        /* PMB OS: hosts without a usable /tmp (Android) export PMBOS_TMPDIR; must match ntdll */
++        const char *tmp_dir = getenv( "PMBOS_TMPDIR" );
++        if (!tmp_dir || tmp_dir[0] != '/') tmp_dir = "/tmp";
++        if (asprintf( &base_dir, "%s/.wine-%u", tmp_dir, getuid() ) == -1)
++            fatal_error( "out of memory\n" );
++    }
+ #endif
+     create_dir( base_dir, &st2 );
+ 

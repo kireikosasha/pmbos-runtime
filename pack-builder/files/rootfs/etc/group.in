@@ -1,0 +1,4 @@
+root:x:0:
+pmbos:x:@PMBOS_GID@:
+inet:x:3003:pmbos
+nogroup:x:65534:

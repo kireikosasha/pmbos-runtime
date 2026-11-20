@@ -1,0 +1,811 @@
+PMB OS patch: execve redirect through $PMBOS_LOADER (Android "loader in jniLibs" exec mode)
+Upstream: glibc 2.36 as shipped by Debian bookworm, source package glibc 2.36-9+deb12u14
+          (pinned: GLIBC_DEBIAN_VERSION in versions.env = debian_version in
+          pmbos/tools/loader/VERSION), after Debian's quilt series and after
+          glibc-2.36-pmbos-rootfs.patch; also applies to plain glibc-2.36.tar.xz.
+Apply:    patch -p1 --fuzz=0 < glibc-2.36-pmbos-execve.patch   (stages/stage-glibc.sh)
+
+Why: with targetSdk >= 29 Android forbids execve() of files in the app data dir (SELinux: no
+execute_no_trans on app_data_file), so imagefs programs (box64, dash, ...) cannot be exec'd.
+execve() of the APK's extracted native libraries and mmap(PROT_EXEC) of app data files are
+still allowed. The APK ships Debian's stock ld.so of the SAME glibc version as
+<nativeLibraryDir>/libpmbld.so (pmbos/tools/loader); the launcher starts
+  libpmbld.so --library-path <libdirs> --argv0 <argv0> <imagefs>/usr/bin/box64 ...
+and every glibc program those processes start must go through the loader as well.
+
+What: sysdeps/unix/sysv/linux/execve.c replaces the execve syscall stub of syscalls.list
+(__execve, weak execve - the entry point of execv/execvp/execvpe/execl*, posix_spawn(p),
+system, popen and wordexp inside libc). With PMBOS_LOADER unset it is exactly the stub. With
+PMBOS_LOADER=<absolute ld.so> (taken from envp, else from the caller's environment; ignored
+for AT_SECURE) it calls sysdeps/unix/sysv/linux/pmbos-execve.h, which rewrites
+  execve(PATH, [ARG0, ARG1...], ENVP)
+for a dynamically linked glibc program of this machine (ELF of the libc's class/byte
+order/e_machine, ET_EXEC/ET_DYN, PT_INTERP basename "ld-linux*") into
+  execve($PMBOS_LOADER, [$PMBOS_LOADER, "--library-path", $PMBOS_LOADER_LIBPATH,
+         "--argv0", ARG0, PATH, ARG1...], ENVP)
+("--library-path" only if PMBOS_LOADER_LIBPATH is non-empty, "--argv0" only if ARG0
+exists, PATH as "./PATH" if it has no '/' or starts with '-'). "#!" scripts are parsed like
+Linux binfmt_script (256 bytes, interpreter + one optional argument, ENOEXEC rules); a
+missing absolute interpreter becomes $PMBOS_ROOTFS<interp>; the interpreter is then handled
+the same way with [INTERP, OPTARG, PATH, ARG1...] (up to 4 nested scripts, then ELOOP).
+Static programs, other loaders (Android's /system/bin/linker64), foreign machines, other
+formats, non-regular/unreadable/missing files and files the caller may not execute
+(access X_OK; ld.so itself does not check) use the plain syscall. EACCES for an
+executable regular file in no known format is reported as ENOEXEC (what Linux says when
+SELinux does not refuse first; keeps execvp's /bin/sh fallback). If the new vector would
+exceed the kernel's pointer limit (min(6 MiB, RLIMIT_STACK/4), >= 128 KiB) -> E2BIG before
+anything is allocated. Async-signal- and vfork-safe (posix_spawn's child): no malloc, stdio
+or locks; fstatat/open/pread/close/access/getrlimit/execve only; vectors via alloca.
+
+Not covered (documented): execveat() and fexecve() (direct execveat syscall), raw
+syscall(SYS_execve), /proc/self/exe of a redirected program (= the loader; ld.so fixes argv
+and AT_EXECFN). No rtld/ld.so change and no struct/ABI change: the stock Debian ld.so of the
+same version works with this libc.so.6.
+
+Unit test: src/glibc-execve-hosttest.c (tests/execve-redirect-hosttest.sh extracts
+pmbos-execve.h from this patch); integration test: src/glibc-execve-test.c (stage glibc,
+with the rebuilt and with the stock pinned loader).
+
+--- /dev/null
++++ b/sysdeps/unix/sysv/linux/execve.c
+@@ -0,0 +1,124 @@
++/* Linux execve, with the PMB OS loader redirect.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++/* Replaces the execve entry of syscalls.list (the plain syscall stub).
++   With PMBOS_LOADER unset - or on a machine without the redirect - this is
++   exactly that stub.  See pmbos-execve.h for the redirect.  */
++
++#include <alloca.h>
++#include <elf.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stddef.h>
++/* Compiler-generated memset/memcpy calls (byte loops) bind to libc's hidden
++   internal symbols.  */
++#include <string.h>
++#include <unistd.h>
++#include <sys/resource.h>
++#include <sys/stat.h>
++#include <not-cancel.h>
++#include <sysdep.h>
++
++#if defined __aarch64__ && !defined __AARCH64EB__
++# define PMBOS_ELF_MACHINE EM_AARCH64
++#elif defined __x86_64__ && defined __LP64__
++# define PMBOS_ELF_MACHINE EM_X86_64
++#endif
++
++#ifdef PMBOS_ELF_MACHINE
++
++/* Hooks of pmbos-execve.h.  Only syscall wrappers: this code also runs in
++   the vfork-like child of posix_spawn.  */
++
++static int
++pmbos_x_filetype (const char *path)
++{
++  struct __stat64_t64 st;
++  if (__fstatat64_time64 (AT_FDCWD, path, &st, 0) != 0)
++    return -errno;
++  return S_ISREG (st.st_mode) ? 1 : 0;
++}
++
++static int
++pmbos_x_open (const char *path)
++{
++  int fd = __open64_nocancel (path,
++			      O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK);
++  return fd < 0 ? -errno : fd;
++}
++
++static long int
++pmbos_x_pread (int fd, void *buf, size_t len, unsigned long long off)
++{
++  ssize_t r = __pread64_nocancel (fd, buf, len, (__off64_t) off);
++  return r < 0 ? -errno : (long int) r;
++}
++
++static int
++pmbos_x_access_x (const char *path)
++{
++  return __access (path, X_OK) == 0 ? 0 : -errno;
++}
++
++static unsigned long long
++pmbos_x_stack_rlimit (void)
++{
++  struct rlimit rl;
++  if (__getrlimit (RLIMIT_STACK, &rl) != 0)
++    return RLIM_INFINITY;
++  return rl.rlim_cur;
++}
++
++static int
++pmbos_x_execve (const char *path, char *const argv[], char *const envp[])
++{
++  return INTERNAL_SYSCALL_CALL (execve, path, argv, envp);
++}
++
++# define PMBOS_X_FILETYPE(path) pmbos_x_filetype (path)
++# define PMBOS_X_OPEN(path) pmbos_x_open (path)
++# define PMBOS_X_PREAD(fd, buf, len, off) pmbos_x_pread (fd, buf, len, off)
++# define PMBOS_X_CLOSE(fd) __close_nocancel_nostatus (fd)
++# define PMBOS_X_ACCESS_X(path) pmbos_x_access_x (path)
++# define PMBOS_X_EXECVE(path, argv, envp) pmbos_x_execve (path, argv, envp)
++# define PMBOS_X_STACK_RLIMIT() pmbos_x_stack_rlimit ()
++# define PMBOS_X_ENVIRON __environ
++# define PMBOS_X_SECURE __libc_enable_secure
++# define PMBOS_X_ALLOCA(size) alloca (size)
++
++# include "pmbos-execve.h"
++
++int
++__execve (const char *path, char *const argv[], char *const envp[])
++{
++  /* Returns only on failure.  */
++  int ret = __pmbos_execve (path, argv, envp);
++  return INLINE_SYSCALL_ERROR_RETURN_VALUE (-ret);
++}
++
++#else /* !PMBOS_ELF_MACHINE */
++
++int
++__execve (const char *path, char *const argv[], char *const envp[])
++{
++  return INLINE_SYSCALL_CALL (execve, path, argv, envp);
++}
++
++#endif
++
++weak_alias (__execve, execve)
+--- /dev/null
++++ b/sysdeps/unix/sysv/linux/pmbos-execve.h
+@@ -0,0 +1,623 @@
++/* PMB OS: execve redirect through an explicitly executed dynamic loader.
++   This file is distributed under the same terms as the GNU C Library
++   (LGPL-2.1-or-later).
++
++   Android (targetSdk >= 29) forbids execve() of files in an app's data
++   directory (SELinux: no execute_no_trans on app_data_file), but it still
++   allows execve() of the app's extracted native libraries and
++   mmap(PROT_EXEC) of app data files.  PMB OS ships glibc's ld.so as
++   <nativeLibraryDir>/libpmbld.so and runs every glibc program through it.
++   The launcher exports
++
++     PMBOS_LOADER=<absolute path of that ld.so>
++     PMBOS_LOADER_LIBPATH=<colon separated library directories> (optional)
++     PMBOS_ROOTFS=<absolute imagefs path>                       (optional)
++
++   With PMBOS_LOADER set, __execve (and so execv*, posix_spawn*, system,
++   popen and wordexp, which all end there) rewrites
++
++     execve (PATH, [ARG0, ARG1, ...], ENVP)
++
++   for a PATH that is a dynamically linked glibc program of this machine
++   into
++
++     execve ($PMBOS_LOADER, [$PMBOS_LOADER, "--library-path",
++             $PMBOS_LOADER_LIBPATH, "--argv0", ARG0, PATH, ARG1, ...], ENVP)
++
++   Rules:
++   * Each variable is taken from ENVP when it is non-empty there, otherwise
++     from the calling process's environment.  They are ignored in AT_SECURE
++     processes.  PMBOS_LOADER must be absolute.  An empty or unset
++     PMBOS_LOADER_LIBPATH drops "--library-path" (ld.so then uses
++     LD_LIBRARY_PATH; a given --library-path replaces it).  "--argv0" is
++     dropped when ARGV is empty.  PATH is passed as "./PATH" when it has no
++     '/' (ld.so would search the library path) or starts with '-' (ld.so
++     would parse it as an option).
++   * Targets are classified by content, never by location.  Redirected: a
++     regular file that is an ELF of this machine (class, byte order and
++     e_machine of this libc; ET_EXEC or ET_DYN) whose PT_INTERP basename
++     starts with "ld-linux" (glibc's loader names; also matches the
++     pack builder's 255-character PT_INTERP placeholder, rewritten or not).
++     Everything else - static programs, other loaders such as Android's
++     /system/bin/linker64, foreign machines, other formats, non-regular,
++     unreadable or missing files - goes to the plain execve syscall with
++     the caller's arguments.
++   * Only files the caller may execute (access X_OK) are redirected or
++     resolved as scripts: ld.so does not repeat the kernel's MAY_EXEC check,
++     so a program or script without execute permission (or on a noexec
++     mount) goes to the plain syscall, which fails with EACCES.
++   * "#!" scripts are parsed like Linux binfmt_script: the first 256 bytes,
++     interpreter plus at most one optional argument (the rest of the line,
++     trailing blanks removed), ENOEXEC for a missing or truncated
++     interpreter.  If the interpreter is absolute, does not exist (ENOENT or
++     ENOTDIR) and PMBOS_ROOTFS is set (absolute, not "/"), $PMBOS_ROOTFS is
++     prepended.  The interpreter is then handled like a target itself with
++     the argument vector [INTERP, OPTARG, PATH, ARG1, ...], where INTERP is
++     the path actually used (the mapped one, so that programs that locate
++     themselves through argv[0] work).  Scripts are always resolved here
++     (also for plain interpreters): SELinux checks execute_no_trans on the
++     script file itself.  At most four nested scripts (Linux before 5.8:
++     BINPRM_MAX_RECURSION), then ELOOP.
++   * ENOEXEC: when the plain syscall fails with EACCES for a regular,
++     executable (access X_OK) file that is neither an ELF nor a valid "#!"
++     script, the kernel would have reported ENOEXEC had SELinux not refused
++     it first; ENOEXEC is returned, so that execvp's /bin/sh fallback works.
++   * E2BIG: the new argument vector lives on the stack.  If the pointers
++     alone (new argv + envp) exceed the kernel's argument space limit
++     (min (6 MiB, RLIMIT_STACK / 4), at least 128 KiB) the kernel would fail
++     with E2BIG, and so does this code, before allocating anything.  String
++     sizes are left to the kernel.  posix_spawn sizes its child stack for
++     argc pointers plus 32 KiB; this code needs about argc pointers plus
++     2 KiB plus the mapped interpreter path strings.
++   * Async-signal-safe and vfork-safe: no malloc, no stdio, no locks, no
++     global state; only the syscalls of the hooks below.
++   * Not covered: execveat and fexecve (direct execveat syscall), raw
++     syscall (SYS_execve), and /proc/self/exe of a redirected program (it is
++     the loader; ld.so does fix AT_EXECFN and argv).
++
++   The includer provides the hooks (negative errno values on failure):
++     PMBOS_X_FILETYPE (path)            1 regular file, 0 other type (stat)
++     PMBOS_X_OPEN (path)                fd, read-only, close-on-exec, nonblocking
++     PMBOS_X_PREAD (fd, buf, len, off)  bytes read
++     PMBOS_X_CLOSE (fd)
++     PMBOS_X_ACCESS_X (path)            0 if executable (access X_OK)
++     PMBOS_X_EXECVE (path, argv, envp)  the execve syscall (returns on failure)
++     PMBOS_X_STACK_RLIMIT ()            RLIMIT_STACK soft limit (unsigned long long)
++     PMBOS_X_ENVIRON                    environment of the calling process
++     PMBOS_X_SECURE                     nonzero in AT_SECURE processes
++     PMBOS_X_ALLOCA (size)              stack memory
++   and PMBOS_ELF_MACHINE, the e_machine of this libc (64-bit little-endian
++   ELF only).  Only the hooks touch the system, so the same code is unit
++   tested on a host with a fake file system.  */
++
++#ifndef _PMBOS_EXECVE_H
++#define _PMBOS_EXECVE_H 1
++
++#include <stddef.h>
++
++/* Linux constants: BINPRM_BUF_SIZE, PATH_MAX, ARG_MAX (4 KiB pages),
++   _STK_LIM / 4 * 3.  */
++#define PMBOS_BINPRM_BUF 256
++#define PMBOS_PATH_MAX 4096
++#define PMBOS_MAX_SCRIPTS 4
++#define PMBOS_ARG_MIN_LIMIT (32ULL * 4096)
++#define PMBOS_ARG_MAX_LIMIT (6ULL << 20)
++
++/* ELF64 little-endian layout.  */
++#define PMBOS_EHDR_SIZE 64
++#define PMBOS_PHDR_SIZE 56
++#define PMBOS_PHDR_CHUNK 8
++#define PMBOS_PT_INTERP 3
++#define PMBOS_GLIBC_LD_PREFIX "ld-linux"
++#define PMBOS_GLIBC_LD_PREFIX_LEN 8
++
++/* Classification of an exec target.  */
++enum
++{
++  /* Leave it to the kernel: a format it may run (static or foreign ELF,
++     other loader) or a file this code cannot inspect.  */
++  PMBOS_EXEC_PLAIN = 0,
++  /* Regular file in no executable format: the kernel says ENOEXEC.  */
++  PMBOS_EXEC_NOEXEC,
++  /* Dynamically linked glibc program: run through $PMBOS_LOADER.  */
++  PMBOS_EXEC_LOADER,
++  /* "#!" script.  */
++  PMBOS_EXEC_SCRIPT
++};
++
++static size_t
++__pmbos_strlen (const char *s)
++{
++  size_t n = 0;
++  while (s[n] != '\0')
++    ++n;
++  return n;
++}
++
++static int
++__pmbos_has_slash (const char *s)
++{
++  for (; *s != '\0'; ++s)
++    if (*s == '/')
++      return 1;
++  return 0;
++}
++
++/* Value of the variable NAME ("NAME=") in ENV, or NULL.  */
++static const char *
++__pmbos_env_value (char *const *env, const char *name)
++{
++  if (env == NULL)
++    return NULL;
++  for (; *env != NULL; ++env)
++    {
++      const char *e = *env;
++      const char *n = name;
++      while (*n != '\0' && *e == *n)
++	{
++	  ++e;
++	  ++n;
++	}
++      if (*n == '\0')
++	return e;
++    }
++  return NULL;
++}
++
++/* Non-empty value of NAME from ENVP, else from ENVIRON, else NULL.  */
++static const char *
++__pmbos_getenv (char *const *envp, char *const *environ_, const char *name)
++{
++  const char *v = __pmbos_env_value (envp, name);
++  if (v == NULL || v[0] == '\0')
++    v = __pmbos_env_value (environ_, name);
++  if (v != NULL && v[0] == '\0')
++    v = NULL;
++  return v;
++}
++
++/* Length of ROOT without trailing slashes if it is a usable rootfs prefix
++   (absolute, not "/"), else 0.  */
++static size_t
++__pmbos_rootfs_len (const char *root)
++{
++  if (root == NULL || root[0] != '/')
++    return 0;
++  size_t len = __pmbos_strlen (root);
++  while (len > 0 && root[len - 1] == '/')
++    --len;
++  return len;
++}
++
++/* The kernel's argument space limit (fs/exec.c, bprm_stack_limits) for a
++   RLIMIT_STACK soft limit of RLIM.  */
++static unsigned long long
++__pmbos_arg_limit (unsigned long long rlim)
++{
++  unsigned long long limit = PMBOS_ARG_MAX_LIMIT;
++  if (rlim / 4 < limit)
++    limit = rlim / 4;
++  if (limit < PMBOS_ARG_MIN_LIMIT)
++    limit = PMBOS_ARG_MIN_LIMIT;
++  return limit;
++}
++
++static unsigned int
++__pmbos_u16 (const unsigned char *p)
++{
++  return (unsigned int) p[0] | ((unsigned int) p[1] << 8);
++}
++
++static unsigned int
++__pmbos_u32 (const unsigned char *p)
++{
++  return __pmbos_u16 (p) | ((unsigned int) __pmbos_u16 (p + 2) << 16);
++}
++
++static unsigned long long
++__pmbos_u64 (const unsigned char *p)
++{
++  return (unsigned long long) __pmbos_u32 (p)
++	 | ((unsigned long long) __pmbos_u32 (p + 4) << 32);
++}
++
++/* Checks the ELF header in B (N bytes, N >= 4, ELF magic present) like the
++   Linux ELF loader.  Returns 1 and the program header table position if it
++   is an executable of this machine, else 0.  */
++static int
++__pmbos_elf_header (const unsigned char *b, size_t n,
++		    unsigned long long *phoff, unsigned int *phnum)
++{
++  if (n < PMBOS_EHDR_SIZE)
++    return 0;
++  /* EI_CLASS = ELFCLASS64, EI_DATA = ELFDATA2LSB.  */
++  if (b[4] != 2 || b[5] != 1)
++    return 0;
++  unsigned int type = __pmbos_u16 (b + 16);
++  /* ET_EXEC, ET_DYN.  */
++  if ((type != 2 && type != 3) || __pmbos_u16 (b + 18) != PMBOS_ELF_MACHINE)
++    return 0;
++  if (__pmbos_u16 (b + 54) != PMBOS_PHDR_SIZE)
++    return 0;
++  unsigned int num = __pmbos_u16 (b + 56);
++  if (num < 1 || num > 65536 / PMBOS_PHDR_SIZE)
++    return 0;
++  unsigned long long off = __pmbos_u64 (b + 32);
++  if (off > ~0ULL - 65536)
++    return 0;
++  *phoff = off;
++  *phnum = num;
++  return 1;
++}
++
++/* Incremental basename test of a PT_INTERP string: feed every character
++   up to (excluding) the terminating NUL.  */
++struct __pmbos_base
++{
++  size_t len;
++  char head[PMBOS_GLIBC_LD_PREFIX_LEN];
++};
++
++static void
++__pmbos_base_feed (struct __pmbos_base *b, char c)
++{
++  if (c == '/')
++    b->len = 0;
++  else
++    {
++      if (b->len < PMBOS_GLIBC_LD_PREFIX_LEN)
++	b->head[b->len] = c;
++      ++b->len;
++    }
++}
++
++static int
++__pmbos_base_is_glibc_ld (const struct __pmbos_base *b)
++{
++  static const char prefix[] = PMBOS_GLIBC_LD_PREFIX;
++  if (b->len < PMBOS_GLIBC_LD_PREFIX_LEN)
++    return 0;
++  for (size_t i = 0; i < PMBOS_GLIBC_LD_PREFIX_LEN; ++i)
++    if (b->head[i] != prefix[i])
++      return 0;
++  return 1;
++}
++
++static int
++__pmbos_spacetab (char c)
++{
++  return c == ' ' || c == '\t';
++}
++
++static char *
++__pmbos_next_non_spacetab (char *first, char *last)
++{
++  for (; first <= last; ++first)
++    if (!__pmbos_spacetab (*first))
++      return first;
++  return NULL;
++}
++
++static char *
++__pmbos_next_terminator (char *first, char *last)
++{
++  for (; first <= last; ++first)
++    if (__pmbos_spacetab (*first) || *first == '\0')
++      return first;
++  return NULL;
++}
++
++/* Parses the "#!" line in BUF (PMBOS_BINPRM_BUF bytes, NUL padded after
++   the end of the file) exactly like Linux fs/binfmt_script.c (5.1+) and
++   NUL-terminates the interpreter (*NAME) and the optional argument (*ARG,
++   NULL if none) in place.  Returns 0 or -ENOEXEC.  */
++static int
++__pmbos_parse_shebang (char *buf, char **name, char **arg)
++{
++  char *buf_end = buf + PMBOS_BINPRM_BUF - 1;
++  char *i_end = NULL;
++
++  if (buf[0] != '#' || buf[1] != '!')
++    return -ENOEXEC;
++  /* strnchr: stops at the first NUL.  */
++  for (char *p = buf; p <= buf_end && *p != '\0'; ++p)
++    if (*p == '\n')
++      {
++	i_end = p;
++	break;
++      }
++  if (i_end == NULL)
++    {
++      /* No newline: the interpreter must end with a blank or NUL inside
++	 the buffer, else it may be truncated.  */
++      i_end = __pmbos_next_non_spacetab (buf + 2, buf_end);
++      if (i_end == NULL)
++	return -ENOEXEC;
++      if (__pmbos_next_terminator (i_end, buf_end) == NULL)
++	return -ENOEXEC;
++      i_end = buf_end;
++    }
++  while (__pmbos_spacetab (i_end[-1]))
++    --i_end;
++  char *i_name = __pmbos_next_non_spacetab (buf + 2, i_end);
++  if (i_name == NULL || i_name == i_end)
++    return -ENOEXEC;
++  char *i_arg = NULL;
++  char *i_sep = __pmbos_next_terminator (i_name, i_end);
++  if (i_sep != NULL && *i_sep != '\0')
++    i_arg = __pmbos_next_non_spacetab (i_sep, i_end);
++  *i_end = '\0';
++  if (i_arg != NULL)
++    *i_sep = '\0';
++  *name = i_name;
++  *arg = i_arg;
++  return 0;
++}
++
++/* --- everything below goes through the hooks ------------------------- */
++
++/* Looks for a PT_INTERP naming a glibc loader in the program headers of
++   the ELF file FD.  */
++static int
++__pmbos_elf_kind (int fd, unsigned long long phoff, unsigned int phnum)
++{
++  unsigned char ph[PMBOS_PHDR_CHUNK * PMBOS_PHDR_SIZE];
++  unsigned long long ioff = 0, isize = 0;
++  int found = 0;
++
++  for (unsigned int i = 0; i < phnum && !found; i += PMBOS_PHDR_CHUNK)
++    {
++      unsigned int k = phnum - i;
++      if (k > PMBOS_PHDR_CHUNK)
++	k = PMBOS_PHDR_CHUNK;
++      size_t len = (size_t) k * PMBOS_PHDR_SIZE;
++      long int r = PMBOS_X_PREAD (fd, ph, len,
++				  phoff + (unsigned long long) i
++					  * PMBOS_PHDR_SIZE);
++      if (r < 0 || (size_t) r != len)
++	return PMBOS_EXEC_PLAIN;
++      for (unsigned int j = 0; j < k; ++j)
++	{
++	  const unsigned char *p = ph + (size_t) j * PMBOS_PHDR_SIZE;
++	  if (__pmbos_u32 (p) == PMBOS_PT_INTERP)
++	    {
++	      ioff = __pmbos_u64 (p + 8);
++	      isize = __pmbos_u64 (p + 32);
++	      found = 1;
++	      break;
++	    }
++	}
++    }
++  /* Static program, or an interpreter the kernel itself rejects.  */
++  if (!found || isize < 2 || isize > PMBOS_PATH_MAX
++      || ioff > ~0ULL - PMBOS_PATH_MAX)
++    return PMBOS_EXEC_PLAIN;
++
++  /* The kernel requires the last byte to be NUL; the string itself ends
++     at the first NUL (in-place rewrites pad with NULs).  */
++  char c;
++  if (PMBOS_X_PREAD (fd, &c, 1, ioff + isize - 1) != 1 || c != '\0')
++    return PMBOS_EXEC_PLAIN;
++  struct __pmbos_base base;
++  base.len = 0;
++  unsigned long long done = 0;
++  while (done < isize)
++    {
++      char chunk[128];
++      size_t want = sizeof chunk;
++      if (isize - done < want)
++	want = (size_t) (isize - done);
++      long int r = PMBOS_X_PREAD (fd, chunk, want, ioff + done);
++      if (r <= 0)
++	return PMBOS_EXEC_PLAIN;
++      for (long int j = 0; j < r; ++j)
++	{
++	  if (chunk[j] == '\0')
++	    return (__pmbos_base_is_glibc_ld (&base)
++		    ? PMBOS_EXEC_LOADER : PMBOS_EXEC_PLAIN);
++	  __pmbos_base_feed (&base, chunk[j]);
++	}
++      done += (unsigned long long) r;
++    }
++  return PMBOS_EXEC_PLAIN;
++}
++
++/* Classifies FILE; LINE (PMBOS_BINPRM_BUF bytes) receives the start of the
++   file, NUL padded.  *ISREG tells whether FILE is a regular file.  Returns
++   a PMBOS_EXEC_* value, or the negative errno of stat (missing file).  */
++static int
++__pmbos_classify (const char *file, char *line, int *isreg)
++{
++  *isreg = 0;
++  int type = PMBOS_X_FILETYPE (file);
++  if (type < 0)
++    return type;
++  if (type != 1)
++    return PMBOS_EXEC_PLAIN;
++  *isreg = 1;
++  int fd = PMBOS_X_OPEN (file);
++  if (fd < 0)
++    return PMBOS_EXEC_PLAIN;
++  int kind = PMBOS_EXEC_NOEXEC;
++  long int n = PMBOS_X_PREAD (fd, line, PMBOS_BINPRM_BUF, 0);
++  if (n < 0)
++    kind = PMBOS_EXEC_PLAIN;
++  else
++    {
++      for (long int i = n; i < PMBOS_BINPRM_BUF; ++i)
++	line[i] = '\0';
++      const unsigned char *u = (const unsigned char *) line;
++      unsigned long long phoff = 0;
++      unsigned int phnum = 0;
++      if (n >= 2 && line[0] == '#' && line[1] == '!')
++	kind = PMBOS_EXEC_SCRIPT;
++      else if (n >= 4 && u[0] == 0x7f && u[1] == 'E' && u[2] == 'L'
++	       && u[3] == 'F')
++	kind = (__pmbos_elf_header (u, (size_t) n, &phoff, &phnum)
++		? __pmbos_elf_kind (fd, phoff, phnum) : PMBOS_EXEC_PLAIN);
++    }
++  PMBOS_X_CLOSE (fd);
++  return kind;
++}
++
++/* execve (FILE, [HEAD..., MID..., TAIL...], ENVP) with the vector on the
++   stack.  */
++static int
++__pmbos_exec_vector (const char *file, const char *const *head, size_t nhead,
++		     const char *const *mid, size_t nmid,
++		     char *const *tail, size_t ntail, char *const envp[])
++{
++  size_t envc = 0;
++  if (envp != NULL)
++    while (envp[envc] != NULL)
++      ++envc;
++  unsigned long long limit
++    = __pmbos_arg_limit (PMBOS_X_STACK_RLIMIT ()) / sizeof (char *);
++  if (ntail >= limit || envc >= limit
++      || nhead + nmid + ntail + envc >= limit)
++    return -E2BIG;
++  size_t n = nhead + nmid + ntail;
++  char **v = PMBOS_X_ALLOCA ((n + 1) * sizeof (char *));
++  size_t k = 0;
++  for (size_t i = 0; i < nhead; ++i)
++    v[k++] = (char *) head[i];
++  for (size_t i = 0; i < nmid; ++i)
++    v[k++] = (char *) mid[i];
++  for (size_t i = 0; i < ntail; ++i)
++    v[k++] = tail[i];
++  v[k] = NULL;
++  return PMBOS_X_EXECVE (file, v, envp);
++}
++
++/* execve with the PMB OS redirect.  Returns only on failure, with the
++   negative errno value.  */
++static int
++__pmbos_execve (const char *path, char *const argv[], char *const envp[])
++{
++  char *const *environ_ = PMBOS_X_ENVIRON;
++  const char *loader = NULL;
++  if (!PMBOS_X_SECURE && path != NULL)
++    loader = __pmbos_getenv (envp, environ_, "PMBOS_LOADER=");
++  if (loader == NULL || loader[0] != '/')
++    return PMBOS_X_EXECVE (path, argv, envp);
++
++  size_t argc = 0;
++  if (argv != NULL)
++    while (argv[argc] != NULL)
++      ++argc;
++  /* The vector after the program: MID (script arguments, innermost
++     first) and TAIL (ARGV[1...]).  ARG0 is argv[0] of the program.  */
++  const char *arg0 = argc > 0 ? argv[0] : NULL;
++  char *const *tail = argc > 0 ? argv + 1 : NULL;
++  size_t ntail = argc > 0 ? argc - 1 : 0;
++  const char *mid[2 * PMBOS_MAX_SCRIPTS];
++  size_t nmid = 0;
++  /* One header buffer per level; script strings stay in them.  */
++  char lines[PMBOS_MAX_SCRIPTS + 1][PMBOS_BINPRM_BUF];
++  const char *file = path;
++
++  for (int depth = 0;; ++depth)
++    {
++      int isreg;
++      int kind = __pmbos_classify (file, lines[depth], &isreg);
++      if (kind < 0 && depth > 0 && (kind == -ENOENT || kind == -ENOTDIR)
++	  && file[0] == '/')
++	{
++	  /* Missing absolute interpreter: try it below $PMBOS_ROOTFS.  */
++	  const char *root = __pmbos_getenv (envp, environ_, "PMBOS_ROOTFS=");
++	  size_t rlen = __pmbos_rootfs_len (root);
++	  size_t flen = __pmbos_strlen (file);
++	  if (rlen > 0 && rlen + flen < PMBOS_PATH_MAX)
++	    {
++	      char *mapped = PMBOS_X_ALLOCA (rlen + flen + 1);
++	      for (size_t i = 0; i < rlen; ++i)
++		mapped[i] = root[i];
++	      for (size_t i = 0; i <= flen; ++i)
++		mapped[rlen + i] = file[i];
++	      int mkind = __pmbos_classify (mapped, lines[depth], &isreg);
++	      if (mkind >= 0)
++		{
++		  kind = mkind;
++		  file = mapped;
++		  arg0 = mapped;
++		}
++	    }
++	}
++      if (kind < 0)
++	kind = PMBOS_EXEC_PLAIN;
++      /* The kernel's MAY_EXEC check, which ld.so skips.  */
++      if ((kind == PMBOS_EXEC_LOADER || kind == PMBOS_EXEC_SCRIPT)
++	  && PMBOS_X_ACCESS_X (file) != 0)
++	kind = PMBOS_EXEC_PLAIN;
++
++      if (kind == PMBOS_EXEC_SCRIPT)
++	{
++	  char *name, *arg;
++	  if (__pmbos_parse_shebang (lines[depth], &name, &arg) != 0)
++	    kind = PMBOS_EXEC_NOEXEC;
++	  else if (depth == PMBOS_MAX_SCRIPTS)
++	    return -ELOOP;
++	  else
++	    {
++	      /* Linux: [NAME, ARG, FILE, old argv[1...]].  */
++	      size_t add = arg != NULL ? 2 : 1;
++	      for (size_t i = nmid; i > 0; --i)
++		mid[i - 1 + add] = mid[i - 1];
++	      if (arg != NULL)
++		mid[0] = arg;
++	      mid[add - 1] = file;
++	      nmid += add;
++	      arg0 = name;
++	      file = name;
++	      continue;
++	    }
++	}
++
++      if (kind == PMBOS_EXEC_LOADER)
++	{
++	  const char *head[7];
++	  size_t nhead = 0;
++	  head[nhead++] = loader;
++	  const char *libpath
++	    = __pmbos_getenv (envp, environ_, "PMBOS_LOADER_LIBPATH=");
++	  if (libpath != NULL)
++	    {
++	      head[nhead++] = "--library-path";
++	      head[nhead++] = libpath;
++	    }
++	  if (arg0 != NULL)
++	    {
++	      head[nhead++] = "--argv0";
++	      head[nhead++] = arg0;
++	    }
++	  const char *prog = file;
++	  if (file[0] == '-' || !__pmbos_has_slash (file))
++	    {
++	      size_t flen = __pmbos_strlen (file);
++	      char *p = PMBOS_X_ALLOCA (flen + 3);
++	      p[0] = '.';
++	      p[1] = '/';
++	      for (size_t i = 0; i <= flen; ++i)
++		p[2 + i] = file[i];
++	      prog = p;
++	    }
++	  head[nhead++] = prog;
++	  return __pmbos_exec_vector (loader, head, nhead, mid, nmid,
++				      tail, ntail, envp);
++	}
++
++      /* PMBOS_EXEC_PLAIN or PMBOS_EXEC_NOEXEC: the kernel decides.  */
++      int ret;
++      if (depth == 0)
++	ret = PMBOS_X_EXECVE (path, argv, envp);
++      else
++	ret = __pmbos_exec_vector (file, &arg0, 1, mid, nmid, tail, ntail,
++				   envp);
++      if (ret == -EACCES && kind == PMBOS_EXEC_NOEXEC && isreg
++	  && PMBOS_X_ACCESS_X (file) == 0)
++	ret = -ENOEXEC;
++      return ret;
++    }
++}
++
++#endif /* pmbos-execve.h */
+--- a/sysdeps/unix/sysv/linux/syscalls.list
++++ b/sysdeps/unix/sysv/linux/syscalls.list
+@@ -10,7 +10,6 @@
+ epoll_create1	EXTRA	epoll_create1	i:i	epoll_create1
+ epoll_ctl	EXTRA	epoll_ctl	i:iiip	epoll_ctl
+ eventfd		EXTRA	eventfd2	i:ii	eventfd
+-execve		-	execve		i:spp	__execve	execve
+ flock		-	flock		i:ii	__flock		flock
+ fsconfig	EXTRA	fsconfig	i:iUsNi	fsconfig
+ fsmount		EXTRA	fsmount		i:iUU	fsmount

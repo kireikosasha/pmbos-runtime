@@ -1,0 +1,587 @@
+# PMB OS runtime packs: build with pack-builder on GitHub-hosted runners and publish them as a GitHub Release.
+# Lives at .github/workflows/build-packs.yml of the public packs repo (layout: pack-builder/, loader/VERSION;
+# created by pack-builder/github/export.sh). The app's default index URL is
+#   https://github.com/<this repo>/releases/latest/download/index.json
+# so every non-prerelease release published here is picked up by the app automatically.
+#
+# Job graph (arm64 work runs natively on ubuntu-24.04-arm: no qemu; Wine on x86_64):
+#   plan -> fetch -> imagefs (arm64: pmbshm, libxcb, glibc, rootfs) --+
+#                 -> box64   (arm64: generic + SoC variants)          |
+#                 -> mesa    (arm64: Turnip + Zink)                   +-> package (arm64: post + verify) -> publish
+#                 -> wine    (x86_64, one job per Wine version)       |                (index, checks, release)
+#                 -> repack  (DXVK, VKD3D-Proton, wine-mono/gecko)  --+
+name: Build packs
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_suffix:
+        description: "Release tag = packs-<suffix> (empty: packs-<PACKSET_VERSION>-r<run number>)"
+        type: string
+        required: false
+        default: ""
+      wine_versions:
+        description: "Wine versions, space separated, first = recommended (empty: versions.env)"
+        type: string
+        required: false
+        default: ""
+      box64_variants:
+        description: "box64 variants, must contain generic (empty: versions.env)"
+        type: string
+        required: false
+        default: ""
+      prerelease:
+        description: "Publish as prerelease (releases/latest - the app default - ignores prereleases)"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Build and verify only, publish nothing (packs stay in the pb-dist artifact)"
+        type: boolean
+        default: false
+      verify_wine:
+        description: "Stage verify, wine --version under box64: auto = warn on failure, 1 = must pass, 0 = skip"
+        type: choice
+        options: ["auto", "1", "0"]
+        default: "auto"
+  push:
+    tags: ["packs-*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-packs
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  PB_WORK: ${{ github.workspace }}/work
+  PB_ARTIFACTS: ${{ github.workspace }}/artifacts
+  CI_SH: pack-builder/github/ci.sh
+  BUILD_ALL: pack-builder/build-all.sh
+  # extra `docker run` args for stage rootfs (mmdebstrap), e.g. "--privileged"; repo variable, empty by default
+  PMB_DOCKER_ROOTFS_ARGS: ${{ vars.PMB_DOCKER_ROOTFS_ARGS }}
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      base_url: ${{ steps.plan.outputs.base_url }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      dry_run: ${{ steps.plan.outputs.dry_run }}
+      verify_wine: ${{ steps.plan.outputs.verify_wine }}
+      wine_versions: ${{ steps.plan.outputs.wine_versions }}
+      wine_matrix: ${{ steps.plan.outputs.wine_matrix }}
+      box64_variants: ${{ steps.plan.outputs.box64_variants }}
+      cfg_hash: ${{ steps.plan.outputs.cfg_hash }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve tag, URLs and versions
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG_SUFFIX: ${{ inputs.tag_suffix }}
+          INPUT_WINE_VERSIONS: ${{ inputs.wine_versions }}
+          INPUT_BOX64_VARIANTS: ${{ inputs.box64_variants }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_VERIFY_WINE: ${{ inputs.verify_wine }}
+        run: bash "$CI_SH" plan
+
+  fetch:
+    name: Fetch sources
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      WINE_VERSIONS: ${{ needs.plan.outputs.wine_versions }}
+      BOX64_VARIANTS: ${{ needs.plan.outputs.box64_variants }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore build image (tools)
+        id: img-tools
+        uses: actions/cache/restore@v4
+        with:
+          path: images/tools.tar.zst
+          key: pb-img-v1-${{ runner.arch }}-tools-${{ hashFiles('pack-builder/docker/Dockerfile.tools', 'pack-builder/versions.env') }}
+      - name: Load build images
+        run: bash "$CI_SH" images-load images
+      - name: Download cache (verified upstream sources)
+        uses: actions/cache@v4
+        with:
+          path: work/src
+          key: pb-src-${{ hashFiles('pack-builder/versions.env') }}-${{ needs.plan.outputs.cfg_hash }}
+          restore-keys: pb-src-
+      - name: Stage fetch
+        run: bash "$BUILD_ALL" -w "$PB_WORK" -s fetch
+      - name: Export build image (tools)
+        id: save-tools
+        if: always() && steps.img-tools.outputs.cache-hit != 'true'
+        run: bash "$CI_SH" images-save images tools
+      - name: Cache build image (tools)
+        if: always() && steps.save-tools.outputs.saved == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: images/tools.tar.zst
+          key: ${{ steps.img-tools.outputs.cache-primary-key }}
+      - name: Pack sources
+        run: bash "$CI_SH" save pb-src src
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: pb-src
+          path: artifacts/pb-src.tar.zst
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+
+  imagefs:
+    name: imagefs (arm64 glibc, libxcb, libpmbshm, rootfs)
+    needs: [plan, fetch]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    env:
+      WINE_VERSIONS: ${{ needs.plan.outputs.wine_versions }}
+      BOX64_VARIANTS: ${{ needs.plan.outputs.box64_variants }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: bash "$CI_SH" free-disk
+      - name: Restore build image (arm64)
+        id: img-arm64
+        uses: actions/cache/restore@v4
+        with:
+          path: images/arm64.tar.zst
+          key: pb-img-v1-${{ runner.arch }}-arm64-${{ hashFiles('pack-builder/docker/Dockerfile.arm64', 'pack-builder/versions.env') }}
+      - name: Restore build image (tools)
+        id: img-tools
+        uses: actions/cache/restore@v4
+        with:
+          path: images/tools.tar.zst
+          key: pb-img-v1-${{ runner.arch }}-tools-${{ hashFiles('pack-builder/docker/Dockerfile.tools', 'pack-builder/versions.env') }}
+      - name: Load build images
+        run: bash "$CI_SH" images-load images
+      - uses: actions/download-artifact@v4
+        with:
+          name: pb-src
+          path: artifacts
+      - name: Unpack sources
+        run: bash "$CI_SH" restore
+      - name: Stages pmbshm, libxcb, glibc (pinned, PMBOS_ROOTFS + execve patches), rootfs
+        run: bash "$BUILD_ALL" -w "$PB_WORK" -s pmbshm,libxcb,glibc,rootfs
+      - name: List imagefs Debian packages (for SOURCES.txt)
+        run: bash "$CI_SH" imagefs-manifest
+      - name: Export build image (arm64)
+        id: save-arm64
+        if: always() && steps.img-arm64.outputs.cache-hit != 'true'
+        run: bash "$CI_SH" images-save images arm64
+      - name: Cache build image (arm64)
+        if: always() && steps.save-arm64.outputs.saved == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: images/arm64.tar.zst
+          key: ${{ steps.img-arm64.outputs.cache-primary-key }}
+      - name: Export build image (tools)
+        id: save-tools
+        if: always() && steps.img-tools.outputs.cache-hit != 'true'
+        run: bash "$CI_SH" images-save images tools
+      - name: Cache build image (tools)
+        if: always() && steps.save-tools.outputs.saved == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: images/tools.tar.zst
+          key: ${{ steps.img-tools.outputs.cache-primary-key }}
+      - name: Pack results
+        run: >-
+          bash "$CI_SH" save pb-imagefs build/pmbshm build/libxcb build/glibc build/manifest
+          stage/imagefs stage/imagefs.pack.json
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: pb-imagefs
+          path: artifacts/pb-imagefs.tar.zst
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: pb-manifest
+          path: work/build/manifest/
+          retention-days: 3
+          if-no-files-found: error
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: logs-imagefs
+          path: work/build/**/*.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  box64:
+    name: box64 (arm64, ${{ needs.plan.outputs.box64_variants }})
+    needs: [plan, fetch]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    env:
+      WINE_VERSIONS: ${{ needs.plan.outputs.wine_versions }}
+      BOX64_VARIANTS: ${{ needs.plan.outputs.box64_variants }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: bash "$CI_SH" free-disk
+      - name: Restore build image (arm64)
+        id: img-arm64
+        uses: actions/cache/restore@v4
+        with:
+          path: images/arm64.tar.zst
+          key: pb-img-v1-${{ runner.arch }}-arm64-${{ hashFiles('pack-builder/docker/Dockerfile.arm64', 'pack-builder/versions.env') }}
+      - name: Load build images
+        run: bash "$CI_SH" images-load images
+      - uses: actions/download-artifact@v4
+        with:
+          name: pb-src
+          path: artifacts
+      - name: Unpack sources
+        run: bash "$CI_SH" restore
+      - name: Stage box64
+        run: bash "$BUILD_ALL" -w "$PB_WORK" -s box64
+      - name: Export build image (arm64)
+        id: save-arm64
+        if: always() && steps.img-arm64.outputs.cache-hit != 'true'
+        run: bash "$CI_SH" images-save images arm64
+      - name: Cache build image (arm64)
+        if: always() && steps.save-arm64.outputs.saved == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: images/arm64.tar.zst
+          key: ${{ steps.img-arm64.outputs.cache-primary-key }}
+      - name: Pack results
+        run: bash "$CI_SH" save pb-stage-box64 'stage/box64' 'stage/box64.pack.json' 'stage/box64-*'
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: pb-stage-box64
+          path: artifacts/pb-stage-box64.tar.zst
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+
+  mesa:
+    name: Mesa (arm64 Turnip + Zink)
+    needs: [plan, fetch]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    env:
+      WINE_VERSIONS: ${{ needs.plan.outputs.wine_versions }}
+      BOX64_VARIANTS: ${{ needs.plan.outputs.box64_variants }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: bash "$CI_SH" free-disk
+      - name: Restore build image (arm64)
+        id: img-arm64
+        uses: actions/cache/restore@v4
+        with:
+          path: images/arm64.tar.zst
+          key: pb-img-v1-${{ runner.arch }}-arm64-${{ hashFiles('pack-builder/docker/Dockerfile.arm64', 'pack-builder/versions.env') }}
+      - name: Load build images
+        run: bash "$CI_SH" images-load images
+      - uses: actions/download-artifact@v4
+        with:
+          name: pb-src
+          path: artifacts
+      - name: Unpack sources
+        run: bash "$CI_SH" restore
+      - name: Stage mesa
+        run: bash "$BUILD_ALL" -w "$PB_WORK" -s mesa
+      - name: Export build image (arm64)
+        id: save-arm64
+        if: always() && steps.img-arm64.outputs.cache-hit != 'true'
+        run: bash "$CI_SH" images-save images arm64
+      - name: Cache build image (arm64)
+        if: always() && steps.save-arm64.outputs.saved == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: images/arm64.tar.zst
+          key: ${{ steps.img-arm64.outputs.cache-primary-key }}
+      - name: Pack results
+        run: bash "$CI_SH" save pb-stage-mesa 'stage/mesa-*'
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: pb-stage-mesa
+          path: artifacts/pb-stage-mesa.tar.zst
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: logs-mesa
+          path: work/build/**/*.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  wine:
+    name: Wine ${{ matrix.wine }} (x86_64, WoW64)
+    needs: [plan, fetch]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        wine: ${{ fromJSON(needs.plan.outputs.wine_matrix) }}
+    env:
+      WINE_VERSIONS: ${{ needs.plan.outputs.wine_versions }}
+      BOX64_VARIANTS: ${{ needs.plan.outputs.box64_variants }}
+      WINE_BUILD_VERSIONS: ${{ matrix.wine }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: bash "$CI_SH" free-disk
+      - name: Restore build image (amd64)
+        id: img-amd64
+        uses: actions/cache/restore@v4
+        with:
+          path: images/amd64.tar.zst
+          key: pb-img-v1-${{ runner.arch }}-amd64-${{ hashFiles('pack-builder/docker/Dockerfile.amd64', 'pack-builder/versions.env') }}
+      - name: Load build images
+        run: bash "$CI_SH" images-load images
+      - uses: actions/download-artifact@v4
+        with:
+          name: pb-src
+          path: artifacts
+      - name: Unpack sources
+        run: bash "$CI_SH" restore
+      - name: Stage wine
+        run: bash "$BUILD_ALL" -w "$PB_WORK" -s wine
+      - name: Export build image (amd64)
+        id: save-amd64
+        if: always() && steps.img-amd64.outputs.cache-hit != 'true'
+        run: bash "$CI_SH" images-save images amd64
+      - name: Cache build image (amd64)
+        if: always() && steps.save-amd64.outputs.saved == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: images/amd64.tar.zst
+          key: ${{ steps.img-amd64.outputs.cache-primary-key }}
+      - name: Pack results
+        run: bash "$CI_SH" save "pb-stage-wine-$WINE_BUILD_VERSIONS" "stage/wine-$WINE_BUILD_VERSIONS" "stage/wine-$WINE_BUILD_VERSIONS.pack.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: pb-stage-wine-${{ matrix.wine }}
+          path: artifacts/pb-stage-wine-${{ matrix.wine }}.tar.zst
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: logs-wine-${{ matrix.wine }}
+          path: work/build/**/*.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  repack:
+    name: DXVK, VKD3D-Proton, wine-mono, wine-gecko
+    needs: [plan, fetch]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      WINE_VERSIONS: ${{ needs.plan.outputs.wine_versions }}
+      BOX64_VARIANTS: ${{ needs.plan.outputs.box64_variants }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore build image (tools)
+        id: img-tools
+        uses: actions/cache/restore@v4
+        with:
+          path: images/tools.tar.zst
+          key: pb-img-v1-${{ runner.arch }}-tools-${{ hashFiles('pack-builder/docker/Dockerfile.tools', 'pack-builder/versions.env') }}
+      - name: Load build images
+        run: bash "$CI_SH" images-load images
+      - uses: actions/download-artifact@v4
+        with:
+          name: pb-src
+          path: artifacts
+      - name: Unpack sources
+        run: bash "$CI_SH" restore
+      - name: Stage repack
+        run: bash "$BUILD_ALL" -w "$PB_WORK" -s repack
+      - name: Pack results
+        run: >-
+          bash "$CI_SH" save pb-stage-repack 'stage/dxvk-*' 'stage/vkd3d-proton-*' 'stage/wine-mono-*'
+          'stage/wine-gecko-*'
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: pb-stage-repack
+          path: artifacts/pb-stage-repack.tar.zst
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+
+  package:
+    name: Pack archives + verify (arm64)
+    needs: [plan, imagefs, box64, mesa, wine, repack]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    env:
+      WINE_VERSIONS: ${{ needs.plan.outputs.wine_versions }}
+      BOX64_VARIANTS: ${{ needs.plan.outputs.box64_variants }}
+      PMB_VERIFY_WINE: ${{ needs.plan.outputs.verify_wine }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: bash "$CI_SH" free-disk
+      - name: Restore build image (arm64)
+        id: img-arm64
+        uses: actions/cache/restore@v4
+        with:
+          path: images/arm64.tar.zst
+          key: pb-img-v1-${{ runner.arch }}-arm64-${{ hashFiles('pack-builder/docker/Dockerfile.arm64', 'pack-builder/versions.env') }}
+      - name: Restore build image (tools)
+        id: img-tools
+        uses: actions/cache/restore@v4
+        with:
+          path: images/tools.tar.zst
+          key: pb-img-v1-${{ runner.arch }}-tools-${{ hashFiles('pack-builder/docker/Dockerfile.tools', 'pack-builder/versions.env') }}
+      - name: Load build images
+        run: bash "$CI_SH" images-load images
+      - uses: actions/download-artifact@v4
+        with:
+          name: pb-imagefs
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pb-stage-*
+          path: artifacts
+          merge-multiple: true
+      - name: Unpack staged packs
+        run: bash "$CI_SH" restore
+      - name: Stages post (deterministic tar.xz) + verify (reference installer, DIRECT + LOADER mode)
+        run: bash "$BUILD_ALL" -w "$PB_WORK" -s post,verify
+      - name: Export build image (arm64)
+        id: save-arm64
+        if: always() && steps.img-arm64.outputs.cache-hit != 'true'
+        run: bash "$CI_SH" images-save images arm64
+      - name: Cache build image (arm64)
+        if: always() && steps.save-arm64.outputs.saved == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: images/arm64.tar.zst
+          key: ${{ steps.img-arm64.outputs.cache-primary-key }}
+      - name: Export build image (tools)
+        id: save-tools
+        if: always() && steps.img-tools.outputs.cache-hit != 'true'
+        run: bash "$CI_SH" images-save images tools
+      - name: Cache build image (tools)
+        if: always() && steps.save-tools.outputs.saved == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: images/tools.tar.zst
+          key: ${{ steps.img-tools.outputs.cache-primary-key }}
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: pb-dist
+          path: work/dist/
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+  publish:
+    name: Index + GitHub Release
+    needs: [plan, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      WINE_VERSIONS: ${{ needs.plan.outputs.wine_versions }}
+      BOX64_VARIANTS: ${{ needs.plan.outputs.box64_variants }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      BASE_URL: ${{ needs.plan.outputs.base_url }}
+      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore build image (tools)
+        id: img-tools
+        uses: actions/cache/restore@v4
+        with:
+          path: images/tools.tar.zst
+          key: pb-img-v1-${{ runner.arch }}-tools-${{ hashFiles('pack-builder/docker/Dockerfile.tools', 'pack-builder/versions.env') }}
+      - name: Load build images
+        run: bash "$CI_SH" images-load images
+      - uses: actions/download-artifact@v4
+        with:
+          name: pb-dist
+          path: work/dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: pb-manifest
+          path: work/build/manifest
+      - uses: actions/download-artifact@v4
+        with:
+          name: pb-src
+          path: artifacts
+      - name: Unpack sources
+        run: bash "$CI_SH" restore
+      - name: Stage index (URLs below the release download URL)
+        run: bash "$BUILD_ALL" -w "$PB_WORK" -s index -u "$BASE_URL"
+      - name: Verify index.json against the archives
+        run: bash "$CI_SH" check-release "$BASE_URL"
+      - name: SOURCES.txt, source bundle, release notes
+        run: |
+          bash "$CI_SH" sources "$TAG" release-extra
+          bash "$CI_SH" notes "$TAG" "$BASE_URL" release-extra/RELEASE_NOTES.md
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: pb-release-meta
+          path: |
+            work/dist/index.json
+            work/dist/SHA256SUMS
+            release-extra/SOURCES.txt
+            release-extra/RELEASE_NOTES.md
+          retention-days: 14
+          if-no-files-found: error
+      - name: Create the release (draft -> upload -> verify -> publish)
+        if: needs.plan.outputs.dry_run != 'true'
+        env:
+          NOTES_FILE: release-extra/RELEASE_NOTES.md
+        run: >-
+          bash "$CI_SH" publish "$TAG" "$PRERELEASE"
+          work/dist/*.tar.xz work/dist/SHA256SUMS
+          release-extra/SOURCES.txt "release-extra/pmbos-runtime-sources-$TAG.tar"
+          work/dist/index.json
+      - name: Smoke test (download like the app, incl. releases/latest and Range)
+        if: needs.plan.outputs.dry_run != 'true'
+        run: bash "$CI_SH" smoke "$TAG" "$PRERELEASE"
+      - name: Export build image (tools)
+        id: save-tools
+        if: always() && steps.img-tools.outputs.cache-hit != 'true'
+        run: bash "$CI_SH" images-save images tools
+      - name: Cache build image (tools)
+        if: always() && steps.save-tools.outputs.saved == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: images/tools.tar.zst
+          key: ${{ steps.img-tools.outputs.cache-primary-key }}

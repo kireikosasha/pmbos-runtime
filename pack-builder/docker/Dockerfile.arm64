@@ -1,0 +1,44 @@
+# arm64 glibc build environment (same Debian suite as the imagefs, so every binary built
+# here runs against the imagefs glibc). Runs natively on arm64 hosts or through
+# qemu-user/binfmt_misc on x86_64 hosts.
+#   - libpmbshm.so + its self-test
+#   - Debian's glibc rebuilt with the PMBOS_ROOTFS patch (build-deps below) + its self-test
+#   - patched libxcb.so.1
+#   - box64 (all variants)
+#   - Mesa (Turnip/KGSL Vulkan + Zink GL/EGL, X11 platform)
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+FROM --platform=linux/arm64 ${DEBIAN_IMAGE}
+
+ARG MESA_PIP_PACKAGES="meson==1.10.2 mako==1.3.10 PyYAML==6.0.3 packaging==25.0"
+ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8 LANG=C.UTF-8
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates curl git file patch pkg-config xz-utils zstd \
+      binutils cmake ninja-build python3 python3-venv python3-pip bison flex \
+      xcb-proto python3-xcbgen libxau-dev libxdmcp-dev libpthread-stubs0-dev \
+      libdrm-dev libexpat1-dev zlib1g-dev libzstd-dev \
+      libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxxf86vm-dev libxrandr-dev \
+      libxshmfence-dev x11proto-dev \
+      libxcb1-dev libxcb-dri2-0-dev libxcb-dri3-dev libxcb-glx0-dev libxcb-present-dev \
+      libxcb-randr0-dev libxcb-shm0-dev libxcb-sync-dev libxcb-xfixes0-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Build dependencies of the suite's glibc source package (stage glibc). The deb-src entries
+# are only needed to resolve them; the stage adds its own (versions.env mirrors) at run time.
+RUN . /etc/os-release \
+ && { echo "deb-src http://deb.debian.org/debian $VERSION_CODENAME main"; \
+      echo "deb-src http://deb.debian.org/debian $VERSION_CODENAME-updates main"; \
+      echo "deb-src http://deb.debian.org/debian-security $VERSION_CODENAME-security main"; } \
+      > /etc/apt/sources.list.d/pmbos-deb-src.list \
+ && apt-get update \
+ && apt-get build-dep -y --no-install-recommends glibc \
+ && rm -f /etc/apt/sources.list.d/pmbos-deb-src.list \
+ && rm -rf /var/lib/apt/lists/*
+
+# /work is owned by the host user while stages run as root
+RUN git config --system --add safe.directory '*'
+
+# Mesa >= 26 needs meson >= 1.5 (bookworm ships 1.0): pinned tools in a venv.
+RUN python3 -m venv /opt/pb-venv \
+ && /opt/pb-venv/bin/pip install --no-cache-dir ${MESA_PIP_PACKAGES}

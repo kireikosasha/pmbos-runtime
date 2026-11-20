@@ -1,0 +1,20 @@
+# Written by fetch-loader.sh - do not edit by hand. The pack builder's rebuilt glibc must be this
+# exact Debian version (the stock ld.so in the APK runs with the imagefs libc.so.6).
+debian_suite=bookworm
+debian_package=libc6
+debian_source=glibc
+debian_version=2.36-9+deb12u14
+upstream_version=2.36
+arch=arm64
+deb_file=libc6_2.36-9+deb12u14_arm64.deb
+deb_sha256=01f4330719fd4f65580e16ea5a0527f372fca750e8f588d26deaf09f2d3b1cf4
+deb_sha1=85af57bf1f9fa075163e51c99d9536154c21ab7e
+deb_size=2324660
+loader_path=pmbos/src/main/jniLibs/arm64-v8a/libpmbld.so
+loader_source=ld-linux-aarch64.so.1
+loader_sha256=17538b8f9889a470c061f69a8fea8124da89627311cd16546c133a89f09056df
+loader_size=202912
+libc_path=pmbos/src/main/assets/pmbos/selftest/libc.so.6
+libc_source=libc.so.6
+libc_sha256=e4ac8ae1d81e4865e3aadedb962879cf9415903b3f2ba81ec75e9962b86ab8b0
+libc_size=1651408

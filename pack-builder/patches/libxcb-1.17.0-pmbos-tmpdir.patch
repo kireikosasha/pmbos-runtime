@@ -1,0 +1,44 @@
+PMB OS patch: libxcb unix socket directory honours $PMBOS_TMPDIR
+Upstream: libxcb 1.17.0 (Debian trixie libxcb1 1.17.0-2)
+          https://xorg.freedesktop.org/archive/individual/lib/libxcb-1.17.0.tar.xz
+Apply:    patch -p1 --fuzz=0 < libxcb-1.17.0-pmbos-tmpdir.patch
+
+Same change as libxcb-1.15-pmbos-tmpdir.patch, rebased on the 1.17 code layout (used when
+DEBIAN_SUITE=trixie / LIBXCB_VERSION=1.17.0).
+
+--- a/src/xcb_util.c
++++ b/src/xcb_util.c
+@@ -253,6 +253,22 @@
+     static const char unix_base[] = "/tmp/.X11-unix/X";
+ #endif
+     const char *base = unix_base;
++#if !defined(_WIN32) && !defined(__hpux)
++    /* PMB OS: hosts without a usable /tmp (Android) export PMBOS_TMPDIR;
++     * the X server listens on $PMBOS_TMPDIR/.X11-unix/X<display>. */
++    char pmbos_base[PATH_MAX];
++    int pmbos_tmpdir = 0;
++    {
++        const char *tmp_dir = getenv("PMBOS_TMPDIR");
++        if (tmp_dir && tmp_dir[0] == '/') {
++            int n = snprintf(pmbos_base, sizeof(pmbos_base), "%s/.X11-unix/X", tmp_dir);
++            if (n > 0 && (size_t)n < sizeof(pmbos_base)) {
++                base = pmbos_base;
++                pmbos_tmpdir = 1;
++            }
++        }
++    }
++#endif
+     size_t filelen;
+     char *file = NULL;
+     int actual_filelen;
+@@ -313,8 +329,8 @@
+         /* snprintf may truncate the file */
+         filelen = MIN(actual_filelen, filelen - 1);
+ #ifdef HAVE_ABSTRACT_SOCKETS
+-        fd = _xcb_open_abstract(protocol, file, filelen);
+-        if (fd >= 0 || (errno != ENOENT && errno != ECONNREFUSED))
++        fd = pmbos_tmpdir ? -1 : _xcb_open_abstract(protocol, file, filelen);
++        if (!pmbos_tmpdir && (fd >= 0 || (errno != ENOENT && errno != ECONNREFUSED)))
+         {
+             free(file);
+             return fd;

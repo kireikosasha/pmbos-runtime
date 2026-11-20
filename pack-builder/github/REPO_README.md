@@ -1,0 +1,37 @@
+# PMB OS runtime packs
+
+Build pipeline and downloads for the runtime packs that PMB OS installs on demand to run Windows
+programs on Android (arm64): a Debian bookworm arm64 rootfs with a relocatable glibc
+(`imagefs`), box64, Wine (WoW64), Mesa Turnip/Zink, DXVK, VKD3D-Proton, wine-mono and wine-gecko.
+
+**Downloads:** see [Releases](../../releases). The app reads
+`https://github.com/kireikosasha/pmbos-runtime/releases/latest/download/index.json`, which points at the
+newest non-prerelease release. Every archive is listed there with its sha256 and size, and the app checks both.
+
+## How the packs are built
+
+`.github/workflows/build-packs.yml` runs `pack-builder/build-all.sh` stage by stage on GitHub-hosted runners:
+
+* arm64 parts run natively on `ubuntu-24.04-arm`: glibc 2.36 (Debian `2.36-9+deb12u14`, rebuilt with the
+  PMBOS_ROOTFS and execve-redirect patches), libxcb, libpmbshm, the rootfs, box64 and Mesa.
+* Wine runs on `ubuntu-24.04` (x86_64 unix side, x86_64 + i386 PE through MinGW), one job per version.
+* DXVK, VKD3D-Proton, wine-mono and wine-gecko are the official upstream binaries, repacked as they are.
+* The last two jobs pack deterministic `tar.xz` archives and test-install them with the reference installer
+  (`pack-builder/lib/packtool.py install`). They then write `index.json` and publish a GitHub Release.
+
+Every upstream input is pinned with SHA-256 in `pack-builder/versions.env`. `loader/VERSION` pins the glibc
+version: it must match the dynamic loader shipped inside the PMB APK.
+
+To start a build, open Actions, choose "Build packs", then "Run workflow". You can also push a tag named
+`packs-<something>`. The full pipeline is documented in `pack-builder/README.md`.
+
+## Licenses and sources
+
+These packs redistribute third-party software under its own licenses: glibc, Wine and VKD3D-Proton
+(LGPL-2.1-or-later), box64 and Mesa (MIT), DXVK (zlib), wine-gecko (MPL-2.0), wine-mono (mixed: MIT, LGPL
+and MPL), plus Debian packages under their own licenses. Each package's `usr/share/doc/<pkg>/copyright`
+file is kept inside the rootfs.
+
+Every release also includes `SOURCES.txt` and `pmbos-runtime-sources-<tag>.tar`. The tar holds the exact
+upstream source archives of everything that was compiled, every patch, and the complete build scripts.
+`SOURCES.txt` lists where the sources of the repacked binaries and the Debian packages can be found.

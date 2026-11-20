@@ -1,0 +1,19 @@
+# x86_64 build environment for Wine (new WoW64: x86_64 unix side + x86_64/i386 PE via
+# MinGW). The unix side runs under box64 on the device; every library it dlopen()s
+# (X11, freetype, fontconfig, vulkan, EGL/GL, gnutls, alsa, pulse) is wrapped by box64 and
+# served by the native arm64 libraries of the imagefs.
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+FROM --platform=linux/amd64 ${DEBIAN_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8 LANG=C.UTF-8
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates curl git file patch pkg-config xz-utils zstd \
+      binutils python3 flex bison gettext \
+      gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 \
+      libx11-dev libxext-dev libxrender-dev libxrandr-dev libxi-dev libxfixes-dev \
+      libxcursor-dev libxcomposite-dev libxinerama-dev libxxf86vm-dev \
+      libfreetype-dev libfontconfig-dev libvulkan-dev libgnutls28-dev \
+      libasound2-dev libpulse-dev libegl-dev libgl-dev \
+ && rm -rf /var/lib/apt/lists/*
