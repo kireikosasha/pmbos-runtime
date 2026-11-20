@@ -39,7 +39,7 @@ on:
         type: boolean
         default: false
       reuse_run:
-        description: "Run id of an earlier run whose box64/wine stage artifacts are reused instead of rebuilding (empty: build)"
+        description: "Space-separated run ids whose stage artifacts (imagefs, box64, mesa, wine) are reused instead of rebuilding; first match wins (empty: build all)"
         type: string
         required: false
         default: ""
@@ -159,53 +159,78 @@ jobs:
       BOX64_VARIANTS: ${{ needs.plan.outputs.box64_variants }}
     steps:
       - uses: actions/checkout@v4
+      - name: Reuse stage artifacts from an earlier run
+        id: reuse
+        if: inputs.reuse_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN: ${{ inputs.reuse_run }}
+        run: |
+          ok=1
+            got=0; for r in $REUSE_RUN; do rm -rf "artifacts/pb-imagefs"; if gh run download "$r" -R "${{ github.repository }}" -n "pb-imagefs" -D "artifacts/pb-imagefs"; then got=1; break; fi; done; [ "$got" = 1 ] || ok=0
+            got=0; for r in $REUSE_RUN; do rm -rf "artifacts/pb-manifest"; if gh run download "$r" -R "${{ github.repository }}" -n "pb-manifest" -D "artifacts/pb-manifest"; then got=1; break; fi; done; [ "$got" = 1 ] || ok=0
+          if [ "$ok" = 1 ]; then
+            for d in artifacts/pb-imagefs artifacts/pb-manifest; do [ -n "$(ls -A "$d")" ] || ok=0; done
+          fi
+          echo "hit=$([ "$ok" = 1 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "reuse $REUSE_RUN: ok=$ok"
+          if [ "$ok" = 1 ]; then cp -a artifacts/pb-imagefs/. artifacts/; mkdir -p work/build/manifest; cp -a artifacts/pb-manifest/. work/build/manifest/; fi
       - name: Free disk space
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" free-disk
       - name: Restore build image (arm64)
+        if: steps.reuse.outputs.hit != 'true'
         id: img-arm64
         uses: actions/cache/restore@v4
         with:
           path: images/arm64.tar.zst
           key: pb-img-v1-${{ runner.arch }}-arm64-${{ hashFiles('pack-builder/docker/Dockerfile.arm64', 'pack-builder/versions.env') }}
       - name: Restore build image (tools)
+        if: steps.reuse.outputs.hit != 'true'
         id: img-tools
         uses: actions/cache/restore@v4
         with:
           path: images/tools.tar.zst
           key: pb-img-v1-${{ runner.arch }}-tools-${{ hashFiles('pack-builder/docker/Dockerfile.tools', 'pack-builder/versions.env') }}
       - name: Load build images
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" images-load images
       - uses: actions/download-artifact@v4
+        if: steps.reuse.outputs.hit != 'true'
         with:
           name: pb-src
           path: artifacts
       - name: Unpack sources
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" restore
       - name: Stages pmbshm, libxcb, glibc (pinned, PMBOS_ROOTFS + execve patches), rootfs
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$BUILD_ALL" -w "$PB_WORK" -s pmbshm,libxcb,glibc,rootfs
       - name: List imagefs Debian packages (for SOURCES.txt)
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" imagefs-manifest
       - name: Export build image (arm64)
         id: save-arm64
-        if: always() && steps.img-arm64.outputs.cache-hit != 'true'
+        if: always() && steps.img-arm64.outputs.cache-hit != 'true' && steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" images-save images arm64
       - name: Cache build image (arm64)
-        if: always() && steps.save-arm64.outputs.saved == 'true'
+        if: always() && steps.save-arm64.outputs.saved == 'true' && steps.reuse.outputs.hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: images/arm64.tar.zst
           key: ${{ steps.img-arm64.outputs.cache-primary-key }}
       - name: Export build image (tools)
         id: save-tools
-        if: always() && steps.img-tools.outputs.cache-hit != 'true'
+        if: always() && steps.img-tools.outputs.cache-hit != 'true' && steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" images-save images tools
       - name: Cache build image (tools)
-        if: always() && steps.save-tools.outputs.saved == 'true'
+        if: always() && steps.save-tools.outputs.saved == 'true' && steps.reuse.outputs.hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: images/tools.tar.zst
           key: ${{ steps.img-tools.outputs.cache-primary-key }}
       - name: Pack results
+        if: steps.reuse.outputs.hit != 'true'
         run: >-
           bash "$CI_SH" save pb-imagefs build/pmbshm build/libxcb build/glibc build/manifest
           stage/imagefs stage/imagefs.pack.json
@@ -252,7 +277,8 @@ jobs:
           REUSE_RUN: ${{ inputs.reuse_run }}
         run: |
           mkdir -p artifacts
-          if gh run download "$REUSE_RUN" -R "${{ github.repository }}" -n "pb-stage-box64" -D artifacts && ls artifacts/*.tar.zst >/dev/null 2>&1; then
+          got=0; for r in $REUSE_RUN; do if gh run download "$r" -R "${{ github.repository }}" -n "pb-stage-box64" -D artifacts && ls artifacts/*.tar.zst >/dev/null 2>&1; then got=1; break; fi; done
+          if [ "$got" = 1 ]; then
             echo "hit=true" >> "$GITHUB_OUTPUT"; echo "reused pb-stage-box64 from run $REUSE_RUN"
           else
             echo "hit=false" >> "$GITHUB_OUTPUT"; echo "no reusable artifact, building"
@@ -313,35 +339,57 @@ jobs:
       BOX64_VARIANTS: ${{ needs.plan.outputs.box64_variants }}
     steps:
       - uses: actions/checkout@v4
+      - name: Reuse stage artifacts from an earlier run
+        id: reuse
+        if: inputs.reuse_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN: ${{ inputs.reuse_run }}
+        run: |
+          ok=1
+            got=0; for r in $REUSE_RUN; do rm -rf "artifacts/pb-stage-mesa"; if gh run download "$r" -R "${{ github.repository }}" -n "pb-stage-mesa" -D "artifacts/pb-stage-mesa"; then got=1; break; fi; done; [ "$got" = 1 ] || ok=0
+          if [ "$ok" = 1 ]; then
+            for d in artifacts/pb-stage-mesa; do [ -n "$(ls -A "$d")" ] || ok=0; done
+          fi
+          echo "hit=$([ "$ok" = 1 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "reuse $REUSE_RUN: ok=$ok"
+          if [ "$ok" = 1 ]; then for d in artifacts/pb-stage-mesa; do cp -a "$d"/. artifacts/; done; fi
       - name: Free disk space
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" free-disk
       - name: Restore build image (arm64)
+        if: steps.reuse.outputs.hit != 'true'
         id: img-arm64
         uses: actions/cache/restore@v4
         with:
           path: images/arm64.tar.zst
           key: pb-img-v1-${{ runner.arch }}-arm64-${{ hashFiles('pack-builder/docker/Dockerfile.arm64', 'pack-builder/versions.env') }}
       - name: Load build images
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" images-load images
       - uses: actions/download-artifact@v4
+        if: steps.reuse.outputs.hit != 'true'
         with:
           name: pb-src
           path: artifacts
       - name: Unpack sources
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" restore
       - name: Stage mesa
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$BUILD_ALL" -w "$PB_WORK" -s mesa
       - name: Export build image (arm64)
         id: save-arm64
-        if: always() && steps.img-arm64.outputs.cache-hit != 'true'
+        if: always() && steps.img-arm64.outputs.cache-hit != 'true' && steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" images-save images arm64
       - name: Cache build image (arm64)
-        if: always() && steps.save-arm64.outputs.saved == 'true'
+        if: always() && steps.save-arm64.outputs.saved == 'true' && steps.reuse.outputs.hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: images/arm64.tar.zst
           key: ${{ steps.img-arm64.outputs.cache-primary-key }}
       - name: Pack results
+        if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" save pb-stage-mesa 'stage/mesa-*'
       - uses: actions/upload-artifact@v4
         with:
@@ -384,7 +432,8 @@ jobs:
           REUSE_RUN: ${{ inputs.reuse_run }}
         run: |
           mkdir -p artifacts
-          if gh run download "$REUSE_RUN" -R "${{ github.repository }}" -n "pb-stage-wine-${{ matrix.wine }}" -D artifacts && ls artifacts/*.tar.zst >/dev/null 2>&1; then
+          got=0; for r in $REUSE_RUN; do if gh run download "$r" -R "${{ github.repository }}" -n "pb-stage-wine-${{ matrix.wine }}" -D artifacts && ls artifacts/*.tar.zst >/dev/null 2>&1; then got=1; break; fi; done
+          if [ "$got" = 1 ]; then
             echo "hit=true" >> "$GITHUB_OUTPUT"; echo "reused pb-stage-wine-${{ matrix.wine }} from run $REUSE_RUN"
           else
             echo "hit=false" >> "$GITHUB_OUTPUT"; echo "no reusable artifact, building"

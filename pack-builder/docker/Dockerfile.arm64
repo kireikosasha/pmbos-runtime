@@ -19,10 +19,23 @@ RUN apt-get update \
       xcb-proto python3-xcbgen libxau-dev libxdmcp-dev libpthread-stubs0-dev \
       libdrm-dev libexpat1-dev zlib1g-dev libzstd-dev \
       libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxxf86vm-dev libxrandr-dev \
-      libxshmfence-dev x11proto-dev glslang-tools \
+      libxshmfence-dev x11proto-dev \
       libxcb1-dev libxcb-dri2-0-dev libxcb-dri3-dev libxcb-glx0-dev libxcb-present-dev \
       libxcb-randr0-dev libxcb-shm0-dev libxcb-sync-dev libxcb-xfixes0-dev \
  && rm -rf /var/lib/apt/lists/*
+
+# glslangValidator for Mesa (Turnip needs glslang >= 12.2; bookworm ships 11.13). Pinned release + sha256.
+ARG GLSLANG_VERSION=16.6.0
+ARG GLSLANG_SHA256=9c09b901149c729df745057dafa815278aaa101b84d2b6e14f16a42de52f97f2
+RUN curl -fsSL -o /tmp/glslang.tgz "https://github.com/KhronosGroup/glslang/archive/refs/tags/${GLSLANG_VERSION}.tar.gz" \
+ && echo "${GLSLANG_SHA256}  /tmp/glslang.tgz" | sha256sum -c - \
+ && mkdir /tmp/glslang && tar xzf /tmp/glslang.tgz -C /tmp/glslang --strip-components=1 \
+ && cmake -S /tmp/glslang -B /tmp/glslang/b -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_OPT=OFF \
+      -DGLSLANG_TESTS=OFF -DGLSLANG_ENABLE_INSTALL=ON -DCMAKE_INSTALL_PREFIX=/usr/local \
+ && cmake --build /tmp/glslang/b \
+ && cmake --install /tmp/glslang/b \
+ && rm -rf /tmp/glslang /tmp/glslang.tgz \
+ && glslangValidator --version
 
 # Build dependencies of the suite's glibc source package (stage glibc). The deb-src entries
 # are only needed to resolve them; the stage adds its own (versions.env mirrors) at run time.
