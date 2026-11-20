@@ -790,3 +790,47 @@ PMBSHM_EXPORT int shmctl(int shmid, int cmd, struct shmid_ds *buf) {
         return -1;
     }
 }
+
+/* ======================================================================================
+ * W^X fallback for hosts with targetSdk >= 29 (LOADER mode).
+ *
+ * SELinux denies "execmod" on app data files for such apps: a private file mapping that
+ * was written to (wine applies PE relocations) can't be made PROT_EXEC afterwards, and
+ * wine's map_image_into_view then fails ("noexec filesystem?"). Under box64 the x86 code
+ * in those mappings is never executed natively (the dynarec translates it into anonymous
+ * JIT memory, which is allowed), so the exec bit only matters to box64's own bookkeeping.
+ * When the kernel refuses PROT_EXEC with EACCES/EPERM, retry without it. Native code is
+ * unaffected: ld.so maps libraries with PROT_EXEC directly (plain "execute", allowed) and
+ * JIT memory is anonymous. Disable with PMBOS_NOEXEC_FALLBACK=0.
+ * Raw syscalls are used so this works before/without dlsym (no malloc recursion).
+ * ====================================================================================== */
+static int nx_fallback_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("PMBOS_NOEXEC_FALLBACK");
+        v = (e == NULL || strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return v;
+}
+
+PMBSHM_EXPORT int mprotect(void *addr, size_t len, int prot) {
+    long r = syscall(SYS_mprotect, addr, len, prot);
+    if (r != 0 && (errno == EACCES || errno == EPERM) && (prot & PROT_EXEC) && nx_fallback_enabled())
+        r = syscall(SYS_mprotect, addr, len, prot & ~PROT_EXEC);
+    return (int)r;
+}
+
+static void *nx_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    long r = syscall(SYS_mmap, addr, len, prot, flags, fd, off);
+    if (r == -1 && (errno == EACCES || errno == EPERM) && (prot & PROT_EXEC) && fd >= 0 && nx_fallback_enabled())
+        r = syscall(SYS_mmap, addr, len, prot & ~PROT_EXEC, flags, fd, off);
+    return (void *)r;
+}
+
+PMBSHM_EXPORT void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    return nx_mmap(addr, len, prot, flags, fd, off);
+}
+
+PMBSHM_EXPORT void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    return nx_mmap(addr, len, prot, flags, fd, off);
+}
