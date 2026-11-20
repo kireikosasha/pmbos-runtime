@@ -26,14 +26,16 @@ RUN apt-get update \
 
 # Build dependencies of the suite's glibc source package (stage glibc). The deb-src entries
 # are only needed to resolve them; the stage adds its own (versions.env mirrors) at run time.
+# deb822 format with the SAME Signed-By as the image's debian.sources: a one-line "deb-src" entry
+# for the same URI/suite without Signed-By makes apt fail with "Conflicting values set for option Signed-By".
 RUN . /etc/os-release \
- && { echo "deb-src http://deb.debian.org/debian $VERSION_CODENAME main"; \
-      echo "deb-src http://deb.debian.org/debian $VERSION_CODENAME-updates main"; \
-      echo "deb-src http://deb.debian.org/debian-security $VERSION_CODENAME-security main"; } \
-      > /etc/apt/sources.list.d/pmbos-deb-src.list \
+ && K=/usr/share/keyrings/debian-archive-keyring.gpg \
+ && printf 'Types: deb-src\nURIs: http://deb.debian.org/debian\nSuites: %s %s-updates\nComponents: main\nSigned-By: %s\n\nTypes: deb-src\nURIs: http://deb.debian.org/debian-security\nSuites: %s-security\nComponents: main\nSigned-By: %s\n' \
+      "$VERSION_CODENAME" "$VERSION_CODENAME" "$K" "$VERSION_CODENAME" "$K" \
+      > /etc/apt/sources.list.d/pmbos-deb-src.sources \
  && apt-get update \
  && apt-get build-dep -y --no-install-recommends glibc \
- && rm -f /etc/apt/sources.list.d/pmbos-deb-src.list \
+ && rm -f /etc/apt/sources.list.d/pmbos-deb-src.sources \
  && rm -rf /var/lib/apt/lists/*
 
 # /work is owned by the host user while stages run as root
