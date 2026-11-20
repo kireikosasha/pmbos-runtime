@@ -199,6 +199,8 @@ cmd_images_save() {
 
 cmd_imagefs_manifest() {
     local raw="$WORK/build/rootfs-raw" out="$WORK/build/manifest"
+    # the stages ran as root inside the containers: work/build (and rootfs-raw) may be root-owned
+    sudo chown -R "$(id -u):$(id -g)" "$WORK/build"
     mkdir -p "$out"
     [ -d "$raw" ] || die "$raw missing (run stage rootfs first)"
     # package version source source-version, from the dpkg database if mmdebstrap wrote one, else from the
