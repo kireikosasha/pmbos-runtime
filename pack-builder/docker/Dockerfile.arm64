@@ -62,10 +62,13 @@ RUN python3 -m venv /opt/pb-venv \
 # LLVM for stage mesa-sw (llvmpipe / lavapipe). Mesa 26.3 needs LLVM >= 8 with MCJIT (aarch64) and >= 15 for
 # ORCJIT/CLC (both unused here); bookworm's llvm-15 is enough. llvm-15-dev ships the static libLLVM*.a that
 # stage mesa-sw links (-Dshared-llvm=disabled), so the pack does not need libLLVM-15.so at run time.
+# libpolly-<N>-dev: Debian links Polly into LLVM's pass pipeline, so the static "lto"/"passes" components Mesa
+# requests reference -lPolly -lPollyISL (without it: "ld: cannot find -lPolly").
 # Separate layer at the end: the layers above stay identical to the image without LLVM.
 ARG LLVM_MAJOR=15
 RUN apt-get update \
- && apt-get install -y --no-install-recommends llvm-${LLVM_MAJOR}-dev \
+ && apt-get install -y --no-install-recommends llvm-${LLVM_MAJOR}-dev libpolly-${LLVM_MAJOR}-dev \
  && rm -rf /var/lib/apt/lists/* \
  && /usr/lib/llvm-${LLVM_MAJOR}/bin/llvm-config --version \
- && /usr/lib/llvm-${LLVM_MAJOR}/bin/llvm-config --link-static --libnames core mcjit
+ && /usr/lib/llvm-${LLVM_MAJOR}/bin/llvm-config --link-static --libnames core mcjit \
+ && ls /usr/lib/llvm-${LLVM_MAJOR}/lib/libPolly.a /usr/lib/llvm-${LLVM_MAJOR}/lib/libPollyISL.a
