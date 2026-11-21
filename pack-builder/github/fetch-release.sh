@@ -5,9 +5,10 @@
 #
 # Usage: bash pmbos/tools/pack-builder/github/fetch-release.sh [TAG|latest] [options]
 #   TAG                   release tag (e.g. packs-1.0.0-r7); default "latest" = newest non-prerelease release
-#   --types a,b,...       only components of these types (rootfs,box64,wine,dxvk,vkd3d,vulkan-driver,misc...);
+#   --types a,b,...       only components of these types (rootfs,box64,wine,dxvk,vkd3d,vulkan-driver,sw-driver,misc);
 #                         the "requires" closure is always added, whatever its type
-#   --only-recommended    only components marked "recommended" (+ their "requires" closure)
+#   --only-recommended    only components marked "recommended" (+ their "requires" closure); this includes both
+#                         Mesa packs: mesa-<v> (vulkan-driver, Turnip/Adreno) and mesa-sw-<v> (sw-driver, CPU)
 #   --out DIR             output dir (default: pmbos/packs-bundle)
 #   --repo OWNER/NAME     packs repo (default kireikosasha/pmbos-runtime, env PMBOS_PACKS_REPO)
 #   --base-url URL        take index.json/SHA256SUMS/archives from URL/ instead of GitHub (file:// works; tests)
@@ -48,7 +49,7 @@ while [ $# -gt 0 ]; do
         --base-url) [ $# -ge 2 ] || die "--base-url needs a value"; BASE="$2"; shift 2 ;;
         --base-url=*) BASE="${1#*=}"; shift ;;
         --dry-run) DRY=1; shift ;;
-        -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*) die "unknown option $1 (see --help)" ;;
         *) TAG="$1"; shift ;;
     esac

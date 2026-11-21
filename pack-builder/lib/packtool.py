@@ -43,7 +43,7 @@ PLACEHOLDER_HEAD = "/@PMBOS_ROOTFS@"
 PLACEHOLDER_TAIL = "/lib/" + LD_NAME
 KEEP_FILE = ".pmbkeep"
 TEXT_SCAN_LIMIT = 8 * 1024 * 1024
-TYPE_ORDER = ["rootfs", "box64", "wine", "vulkan-driver", "dxvk", "vkd3d", "misc"]
+TYPE_ORDER = ["rootfs", "box64", "wine", "vulkan-driver", "sw-driver", "dxvk", "vkd3d", "misc"]
 
 EM_X86_64 = 62
 EM_AARCH64 = 183
@@ -593,6 +593,9 @@ def cmd_finalize(a):
         "recommended": d["recommended"],
         "description": d["description"],
     }
+    if d["arm64"]:
+        # explicit for every native pack; the app defaults only rootfs/box64/vulkan-driver to arm64-v8a
+        meta["abi"] = ["arm64-v8a"]
     os.makedirs(os.path.join(a.dist, "meta"), exist_ok=True)
     with open(os.path.join(a.dist, "meta", d["id"] + ".json"), "w") as f:
         json.dump(meta, f, indent=2, sort_keys=True)
@@ -646,6 +649,8 @@ def cmd_index(a):
             "recommended": m["recommended"],
             "description": m["description"],
         })
+        if m.get("abi"):
+            comps[-1]["abi"] = m["abi"]
     gen = datetime.datetime.fromtimestamp(a.mtime, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     index = {"format": 1, "name": a.name, "packset": a.packset, "generated": gen, "components": comps}
     with open(a.out, "w") as f:

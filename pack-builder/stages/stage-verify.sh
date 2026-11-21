@@ -82,7 +82,8 @@ xcb=("$fs"/usr/lib/aarch64-linux-gnu/libxcb.so.1.*)
 # captured, not "| grep -q .": under pipefail a SIGPIPE'd writer would turn a hit into a pass
 leftover="$(grep -rlI --exclude-dir=wine-addons '@ROOTFS@' "$fs/etc" "$fs/opt" 2>/dev/null || true)"
 [ -z "$leftover" ] || die "unsubstituted @ROOTFS@ tokens remain after install: ${leftover//$'\n'/ }"
-for icd in "$fs"/opt/mesa-*/share/vulkan/icd.d/freedreno_icd.aarch64.json; do
+# Turnip (mesa-<v>: freedreno_icd) and lavapipe (mesa-sw-<v>: lvp_icd)
+for icd in "$fs"/opt/mesa-*/share/vulkan/icd.d/*_icd.aarch64.json; do
     lib="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ICD"]["library_path"])' "$icd")"
     [ -f "$lib" ] || die "ICD $icd points at missing $lib"
     log "  ICD OK: $lib"

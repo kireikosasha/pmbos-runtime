@@ -75,6 +75,7 @@ prerelease. Индекс содержит абсолютные ссылки на
    | imagefs (pmbshm, libxcb, **glibc**, rootfs) | ubuntu-24.04-arm | 45–80 мин |
    | box64 (generic, sd8g2, sd888) | ubuntu-24.04-arm | 30–60 мин |
    | mesa | ubuntu-24.04-arm | 20–40 мин |
+   | mesa-sw (lavapipe + llvmpipe, статический LLVM 15) | ubuntu-24.04-arm | 30–60 мин |
    | wine 11.0 и wine 11.22 (параллельно) | ubuntu-24.04 | 90–160 мин каждый |
    | repack (dxvk, vkd3d, mono, gecko) | ubuntu-24.04 | 3–5 мин |
    | package (xz -9e, затем verify) | ubuntu-24.04-arm | 25–50 мин |
@@ -86,7 +87,9 @@ prerelease. Индекс содержит абсолютные ссылки на
    * `index.json`, `SHA256SUMS`, `SOURCES.txt`, `pmbos-runtime-sources-<тег>.tar`;
    * архивы `imagefs-bookworm-1.0.0.tar.xz`, `box64-0.4.4.tar.xz`, `box64-sd8g2-0.4.4.tar.xz`,
      `box64-sd888-0.4.4.tar.xz`, `wine-11.0.tar.xz`, `wine-11.22.tar.xz`, `wine-mono-*.tar.xz`,
-     `wine-gecko-2.47.4.tar.xz`, `mesa-26.3.1.tar.xz`, `dxvk-3.1.1.tar.xz`, `vkd3d-proton-3.1.tar.xz`.
+     `wine-gecko-2.47.4.tar.xz`, `mesa-26.3.1.tar.xz`, `mesa-sw-26.3.1.tar.xz`, `dxvk-3.1.1.tar.xz`,
+     `vkd3d-proton-3.1.tar.xz`. `mesa-sw` имеет тип `sw-driver`: это рендеринг на CPU (lavapipe/llvmpipe) для
+     GPU, где нет Turnip (Mali и др.). Тип необязательный, подробности в `pack-builder/README.md`.
 
    Job publish проверяет всё сам. Он сверяет sha256 и размер каждого архива с индексом, проверяет лимит в
    2 ГиБ на ассет и наличие типов rootfs/box64/wine/dxvk/vulkan-driver. После публикации он скачивает
@@ -146,6 +149,7 @@ Glibc жёстко привязан к загрузчику в APK (`loader/VERS
 | VKD3D-Proton (бинарники upstream) | LGPL-2.1+ | указать, где взять исходники этой версии |
 | box64 | MIT | сохранить копирайт и лицензию (`LICENSE.box64` в пакете) |
 | Mesa | MIT и др. | сохранить лицензии (`share/LICENSE.mesa.rst` в пакете) |
+| LLVM (внутри mesa-sw) | Apache-2.0 WITH LLVM-exception | сохранить лицензию (`share/LICENSE.llvm` в пакете mesa-sw) |
 | DXVK | zlib | не выдавать за своё, сохранить уведомление |
 | wine-gecko | MPL-2.0 | указать, где взять исходники |
 | wine-mono | MIT / LGPL / MPL | указать, где взять исходники |

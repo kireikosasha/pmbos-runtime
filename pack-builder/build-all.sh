@@ -12,7 +12,7 @@
 #   -u, --base-url URL    public base URL of the archives (written into index.json), e.g.
 #                         https://github.com/<owner>/<repo>/releases/download/runtime-1.0.0
 #   -s, --stages LIST     comma separated subset of:
-#                         images,fetch,pmbshm,libxcb,glibc,rootfs,box64,wine,mesa,repack,post,verify,index
+#                         images,fetch,pmbshm,libxcb,glibc,rootfs,box64,wine,mesa,mesa-sw,repack,post,verify,index
 #   -p, --packs "IDS"     only (re)finalize these staged pack ids in the post stage
 #   -j, --jobs N          parallel build jobs (default: nproc)
 #       --no-verify       skip the verify stage
@@ -28,7 +28,7 @@ PB_LOG_PREFIX=build-all
 # shellcheck source=versions.env
 . "$PB_HOST/versions.env"
 
-ALL_STAGES="images,fetch,pmbshm,libxcb,glibc,rootfs,box64,wine,mesa,repack,post,verify,index"
+ALL_STAGES="images,fetch,pmbshm,libxcb,glibc,rootfs,box64,wine,mesa,mesa-sw,repack,post,verify,index"
 WORK_HOST="$PB_HOST/out"
 BASE_URL="${BASE_URL:-}"
 STAGES="$ALL_STAGES"
@@ -81,8 +81,9 @@ check_loader_pin() {
         || die "GLIBC_DEBIAN_VERSION=$GLIBC_DEBIAN_VERSION but the APK loader is ${lv[debian_version]:-?} ($f)"
     [ "${lv[deb_sha256]:-}" = "$LIBC6_DEB_SHA256" ] \
         || die "LIBC6_DEB_SHA256 differs from deb_sha256 in $f"
-    [ "${lv[loader_sha256]:-}" = "$LOADER_SHA256" ] \
-        || die "LOADER_SHA256 differs from loader_sha256 in $f"
+    # the APK's libpmbld.so is the stock ld.so + seccomp-patch.py; LOADER_SHA256 pins the stock file
+    [ "${lv[loader_stock_sha256]:-${lv[loader_sha256]:-}}" = "$LOADER_SHA256" ] \
+        || die "LOADER_SHA256 differs from loader_stock_sha256 in $f"
     log "glibc pinned to $GLIBC_DEBIAN_VERSION = APK loader (loader/VERSION)"
 }
 check_loader_pin
@@ -168,6 +169,7 @@ want rootfs && run_stage tools rootfs ${PMB_DOCKER_ROOTFS_ARGS:-}
 want box64  && run_stage arm64 box64
 want wine   && run_stage amd64 wine
 want mesa   && run_stage arm64 mesa
+want mesa-sw && run_stage arm64 mesa-sw
 want repack && run_stage tools repack
 want post   && run_stage tools post
 if want verify && [ "$VERIFY" = 1 ]; then run_stage arm64 verify; fi

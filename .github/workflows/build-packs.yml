@@ -8,6 +8,7 @@
 #   plan -> fetch -> imagefs (arm64: pmbshm, libxcb, glibc, rootfs) --+
 #                 -> box64   (arm64: generic + SoC variants)          |
 #                 -> mesa    (arm64: Turnip + Zink)                   +-> package (arm64: post + verify) -> publish
+#                 -> mesa-sw (arm64: lavapipe + llvmpipe, CPU)        |
 #                 -> wine    (x86_64, one job per Wine version)       |                (index, checks, release)
 #                 -> repack  (DXVK, VKD3D-Proton, wine-mono/gecko)  --+
 name: Build packs
@@ -39,7 +40,7 @@ on:
         type: boolean
         default: false
       reuse_run:
-        description: "Space-separated run ids whose stage artifacts (imagefs, box64, mesa, wine) are reused instead of rebuilding; first match wins (empty: build all)"
+        description: "Space-separated run ids whose stage artifacts (imagefs, box64, mesa, mesa-sw, wine) are reused instead of rebuilding; first match wins (empty: build all)"
         type: string
         required: false
         default: ""
@@ -390,7 +391,7 @@ jobs:
           key: ${{ steps.img-arm64.outputs.cache-primary-key }}
       - name: Pack results
         if: steps.reuse.outputs.hit != 'true'
-        run: bash "$CI_SH" save pb-stage-mesa 'stage/mesa-*'
+        run: bash "$CI_SH" save pb-stage-mesa 'stage/mesa-[0-9]*'
       - uses: actions/upload-artifact@v4
         with:
           overwrite: true
@@ -405,6 +406,86 @@ jobs:
         with:
           overwrite: true
           name: logs-mesa
+          path: work/build/**/*.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  mesa-sw:
+    name: Mesa software rendering (arm64 lavapipe + llvmpipe, static LLVM)
+    needs: [plan, fetch]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    env:
+      WINE_VERSIONS: ${{ needs.plan.outputs.wine_versions }}
+      BOX64_VARIANTS: ${{ needs.plan.outputs.box64_variants }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reuse stage artifacts from an earlier run
+        id: reuse
+        if: inputs.reuse_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN: ${{ inputs.reuse_run }}
+        run: |
+          ok=1
+            got=0; for r in $REUSE_RUN; do rm -rf "artifacts/pb-stage-mesa-sw"; if gh run download "$r" -R "${{ github.repository }}" -n "pb-stage-mesa-sw" -D "artifacts/pb-stage-mesa-sw"; then got=1; break; fi; done; [ "$got" = 1 ] || ok=0
+          if [ "$ok" = 1 ]; then
+            for d in artifacts/pb-stage-mesa-sw; do [ -n "$(ls -A "$d")" ] || ok=0; done
+          fi
+          echo "hit=$([ "$ok" = 1 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "reuse $REUSE_RUN: ok=$ok"
+          if [ "$ok" = 1 ]; then for d in artifacts/pb-stage-mesa-sw; do cp -a "$d"/. artifacts/; done; fi
+      - name: Free disk space
+        if: steps.reuse.outputs.hit != 'true'
+        run: bash "$CI_SH" free-disk
+      - name: Restore build image (arm64)
+        if: steps.reuse.outputs.hit != 'true'
+        id: img-arm64
+        uses: actions/cache/restore@v4
+        with:
+          path: images/arm64.tar.zst
+          key: pb-img-v1-${{ runner.arch }}-arm64-${{ hashFiles('pack-builder/docker/Dockerfile.arm64', 'pack-builder/versions.env') }}
+      - name: Load build images
+        if: steps.reuse.outputs.hit != 'true'
+        run: bash "$CI_SH" images-load images
+      - uses: actions/download-artifact@v4
+        if: steps.reuse.outputs.hit != 'true'
+        with:
+          name: pb-src
+          path: artifacts
+      - name: Unpack sources
+        if: steps.reuse.outputs.hit != 'true'
+        run: bash "$CI_SH" restore
+      - name: Stage mesa-sw
+        if: steps.reuse.outputs.hit != 'true'
+        run: bash "$BUILD_ALL" -w "$PB_WORK" -s mesa-sw
+      - name: Export build image (arm64)
+        id: save-arm64
+        if: always() && steps.img-arm64.outputs.cache-hit != 'true' && steps.reuse.outputs.hit != 'true'
+        run: bash "$CI_SH" images-save images arm64
+      - name: Cache build image (arm64)
+        if: always() && steps.save-arm64.outputs.saved == 'true' && steps.reuse.outputs.hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: images/arm64.tar.zst
+          key: ${{ steps.img-arm64.outputs.cache-primary-key }}
+      - name: Pack results
+        if: steps.reuse.outputs.hit != 'true'
+        run: bash "$CI_SH" save pb-stage-mesa-sw 'stage/mesa-sw-*'
+      - uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: pb-stage-mesa-sw
+          path: artifacts/pb-stage-mesa-sw.tar.zst
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: logs-mesa-sw
           path: work/build/**/*.log
           retention-days: 7
           if-no-files-found: ignore
@@ -534,7 +615,7 @@ jobs:
 
   package:
     name: Pack archives + verify (arm64)
-    needs: [plan, imagefs, box64, mesa, wine, repack]
+    needs: [plan, imagefs, box64, mesa, mesa-sw, wine, repack]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
     env:

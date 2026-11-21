@@ -31,7 +31,8 @@ WORK="${PB_WORK:-${GITHUB_WORKSPACE:-$PWD}/work}"
 ART="${PB_ARTIFACTS:-${RUNNER_TEMP:-/tmp}/pb-artifacts}"
 GH_SERVER="${GITHUB_SERVER_URL:-https://github.com}"
 MAX_ASSET=$((2 * 1024 * 1024 * 1024 - 1))   # GitHub release assets must be < 2 GiB
-# The app's Windows launcher asks for these types (WinLauncher.requiredTypes); vkd3d is optional there.
+# The app's Windows launcher asks for these types (WinLauncher.requiredTypes); vkd3d and sw-driver (mesa-sw: CPU
+# rendering for non-Adreno GPUs) are optional there, so they are not required in a release either.
 REQUIRED_TYPES="rootfs box64 wine dxvk vulkan-driver"
 
 output() { # key value -> $GITHUB_OUTPUT (or stdout)
@@ -352,7 +353,12 @@ cmd_sources() {
             echo "          sha256 $(getv WINE_SHA256 "$v")  patch: builder/patches/wine-${v%%.*}-pmbos-tmpdir.patch"
         done
         echo "mesa      $MESA_VERSION  MIT (+ other permissive licenses, docs/license.rst)  $MESA_URL"
-        echo "          sha256 $MESA_SHA256  (unmodified; meson options in builder/stages/stage-mesa.sh)"
+        echo "          sha256 $MESA_SHA256  (unmodified; meson options in builder/stages/stage-mesa.sh (Turnip + Zink)"
+        echo "          and builder/stages/stage-mesa-sw.sh (lavapipe + llvmpipe, pack mesa-sw-$MESA_VERSION))"
+        echo "llvm      Debian $DEBIAN_SUITE llvm-toolchain-15 (llvm-15-dev, static libraries)  Apache-2.0 WITH LLVM-exception"
+        echo "          linked statically into mesa-sw-$MESA_VERSION (exact package version and any other Debian libraries"
+        echo "          bundled there: opt/mesa-sw-$MESA_VERSION/share/BUILDINFO.mesa-sw.txt + share/doc/ in that pack)"
+        echo "          source: https://snapshot.debian.org/package/llvm-toolchain-15/"
         echo "libpmbshm $PACKSET_VERSION  part of this builder: builder/src/pmbshm.c"
         echo
         echo "== Redistributed unmodified upstream binaries (repacked) =="
@@ -393,7 +399,8 @@ cmd_notes() {
     load_work_config
     local repo="${GITHUB_REPOSITORY:-?}"
     {
-        echo "Runtime packs for PMB OS (Windows apps: imagefs rootfs, box64, Wine, Mesa Turnip/Zink, DXVK, VKD3D-Proton)."
+        echo "Runtime packs for PMB OS (Windows apps: imagefs rootfs, box64, Wine, Mesa Turnip/Zink, Mesa software"
+        echo "rendering (lavapipe + llvmpipe, type sw-driver, for GPUs without Turnip such as Mali), DXVK, VKD3D-Proton)."
         echo
         echo "The app downloads them automatically from \`$GH_SERVER/$repo/releases/latest/download/index.json\`"
         echo "(newest non-prerelease release). This release's own index: \`$base/index.json\`."
@@ -404,7 +411,7 @@ cmd_notes() {
         echo "* \`SHA256SUMS\` lists every archive; \`index.json\` carries sha256 + size, verified by the app."
         echo "* Sources and licenses: \`SOURCES.txt\` and \`pmbos-runtime-sources-$tag.tar\` (upstream source archives,"
         echo "  patches and the complete build scripts). Wine, glibc and VKD3D-Proton are LGPL-2.1+, box64 and Mesa MIT,"
-        echo "  DXVK zlib, wine-gecko MPL-2.0."
+        echo "  LLVM (inside mesa-sw) Apache-2.0 WITH LLVM-exception, DXVK zlib, wine-gecko MPL-2.0."
         echo
         python3 -I - "$WORK/dist/index.json" <<'PY'
 import json, sys

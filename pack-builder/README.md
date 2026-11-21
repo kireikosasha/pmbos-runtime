@@ -13,6 +13,7 @@ repo `index.json` that points at them.
 | `wine-mono-<ver>` | misc | `imagefs` | `opt/wine-addons/mono/wine-mono-<ver>/` (required by the matching wine) |
 | `wine-gecko-<ver>` | misc | `imagefs` | `opt/wine-addons/gecko/wine-gecko-<ver>-{x86,x86_64}/` (optional) |
 | `mesa-<ver>` | vulkan-driver | `imagefs` | `opt/mesa-<ver>/`: Turnip (Adreno, KGSL) Vulkan ICD + Zink `libGL.so.1`/`libEGL.so.1`, X11 WSI |
+| `mesa-sw-<ver>` | sw-driver | `imagefs` | `opt/mesa-sw-<ver>/`: CPU rendering for GPUs without Turnip (Mali, PowerVR...): lavapipe Vulkan ICD (`share/vulkan/icd.d/lvp_icd.aarch64.json`, for DXVK/VKD3D) + llvmpipe `libGL.so.1`/`libEGL.so.1`/GLES2, LLVM 15 linked statically |
 | `dxvk-<ver>` | dxvk | `components/dxvk-<ver>` | `x64/*.dll` (-> system32), `x32/*.dll` (-> syswow64) |
 | `vkd3d-proton-<ver>` | vkd3d | `components/vkd3d-proton-<ver>` | `x64/*.dll`, `x32/*.dll` |
 
@@ -65,7 +66,7 @@ pinned Debian glibc source + `patches/glibc-2.36-pmbos-rootfs.patch` +
 stock `ld.so` = the APK's `libpmbld.so` from the `.deb` (sha256-checked); self-tests:
 `src/glibc-rootfs-test.c`, `tests/execve-redirect-hosttest.sh`, and `src/glibc-execve-test.c` with
 `PMBOS_LOADER` = the rebuilt and = the stock loader), `rootfs` (mmdebstrap extract, libc6 files
-replaced by the rebuild, `/bin/sh`, `/etc`, trimming), `box64`, `wine`, `mesa`, `repack` (DXVK,
+replaced by the rebuild, `/bin/sh`, `/etc`, trimming), `box64`, `wine`, `mesa`, `mesa-sw`, `repack` (DXVK,
 VKD3D-Proton, wine-mono, wine-gecko), `post` (pack finalization), `verify` (install every archive
 with the reference installer in a scratch runtime dir and smoke-test it, also in LOADER mode
 through the stock loader), `index`.
@@ -307,3 +308,48 @@ github/                 GitHub Actions: workflows/build-packs.yml, ci.sh (job he
 files/rootfs/etc/       /etc templates (fonts.conf with @ROOTFS@, passwd(.in), group(.in), hosts,
                         nsswitch.conf, resolv.conf fallback, host.conf)
 ```
+
+## Software rendering pack (`mesa-sw`, type `sw-driver`)
+
+Turnip only drives Adreno GPUs. On every other GPU (Mali, PowerVR, Xclipse...) the Windows runtime renders on the
+CPU with the `mesa-sw-<ver>` pack built by stage `mesa-sw` (job `mesa-sw` in CI):
+
+* **Vulkan: lavapipe** (`-Dvulkan-drivers=swrast`). DXVK (D3D8-11) and VKD3D-Proton (D3D12) run on it unchanged;
+  its X11 WSI always presents through `PutImage`/MIT-SHM (no DRI3, no GPU).
+* **OpenGL / EGL / GLES2: llvmpipe** (`-Dgallium-drivers=llvmpipe`). Mesa 26.3 no longer has `-Dglx=xlib`
+  (its meson.options offer `glx` = auto/disabled/dri only; the xlib GLX was removed in Mesa 25), so GLX is the
+  DRI flavour, which needs a GLX extension in the X server. PMB's X server keeps its GLX stub off, so GL clients
+  (Wine's OpenGL, WineD3D) use **EGL on X11**, whose `swrast` fallback draws with `PutImage`/MIT-SHM and needs
+  nothing server-side.
+* **LLVM** comes from Debian bookworm (`llvm-15-dev` in `docker/Dockerfile.arm64`; Mesa 26.3 needs LLVM >= 8 with
+  MCJIT on aarch64, >= 15 only for ORCJIT/CLC, which are not used). It is linked statically
+  (`-Dshared-llvm=disabled`), so the pack does not need `libLLVM-15.so.1` + libz3/libicu/libxml2. Any remaining
+  `DT_NEEDED` library whose Debian package is not in `ROOTFS_PACKAGES`/`ROOTFS_OPTIONAL_PACKAGES` (e.g.
+  `libtinfo.so.6`) is copied into `opt/mesa-sw-<ver>/lib`, with its copyright in `share/doc/<package>/`. The list
+  is in `share/BUILDINFO.mesa-sw.txt`. Stage post checks the closure against the real imagefs.
+* The stage self-tests lavapipe (it creates an instance and a device, which initializes llvmpipe and the LLVM
+  JIT). Stage verify checks that every installed `*_icd.aarch64.json` points at an existing library.
+
+**Type and compatibility.** The new type `sw-driver` is optional: `github/ci.sh` keeps `REQUIRED_TYPES` = `rootfs box64
+wine dxvk vulkan-driver`. Apps that do not know the type ignore it: `RuntimeApp` lists it under its own heading,
+and `ensureReady` only resolves the types it is asked for. `rm.preferred("vulkan-driver")` still returns the Turnip
+pack. The pack is `recommended`, so `fetch-release.sh --only-recommended` bundles it next to `mesa-<ver>`. Index
+entries of arm64 packs carry `"abi":["arm64-v8a"]`. The app already assumes that ABI for rootfs/box64/vulkan-driver;
+for the new type it has to be explicit.
+
+**How the Windows subsystem should use it** (`WinRuntimeLayout` / `WinEnvironment`). Use it when the device GPU
+is not Adreno, or when no `vulkan-driver` pack is installed, or when the user picks "software rendering":
+`mesaDir = <imagefs>/opt/mesa-sw-<ver>` (from the installed `sw-driver` component, never from the last-resort
+`opt/` scan, where `mesa-sw-*` sorts after `mesa-2*`), then
+
+```
+LD_LIBRARY_PATH=<mesaDir>/lib:<imagefs libs...>
+VK_ICD_FILENAMES=<mesaDir>/share/vulkan/icd.d/lvp_icd.aarch64.json
+LIBGL_DRIVERS_PATH=<mesaDir>/lib/dri
+GALLIUM_DRIVER=llvmpipe            # not zink (not built into this pack)
+                                   # and do NOT set MESA_LOADER_DRIVER_OVERRIDE=zink
+LP_NUM_THREADS=<big cores>         # optional: llvmpipe rasterizer threads
+```
+
+`MESA_VK_WSI_DEBUG=sw`, `MESA_SHADER_CACHE_DIR` and the DXVK/VKD3D variables stay as they are.
+
