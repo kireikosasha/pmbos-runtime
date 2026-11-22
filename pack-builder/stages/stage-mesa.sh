@@ -3,7 +3,8 @@
 #   - Vulkan: Turnip (freedreno) on the Android KGSL kernel interface, X11 WSI
 #   - Vulkan: Venus (virtio) over the vtest socket of the Android-side virglrenderer (venus-android: Mali and other
 #     non-Adreno GPUs run the commands on the device's own Vulkan driver)
-#   - OpenGL / EGL: Zink on top of Turnip (no GLVND: libGL.so.1 / libEGL.so.1 are Mesa's)
+#   - OpenGL / EGL: Zink on top of Turnip or Venus (no GLVND: libGL.so.1 / libEGL.so.1 are Mesa's); patched to run
+#     without robustness2.nullDescriptor (Mali)
 # installed under /opt/mesa-<ver> -> pack "mesa-<ver>" (type vulkan-driver, installDir imagefs).
 # The Vulkan ICD manifest uses the @ROOTFS@ token (textPatch) for its absolute library path.
 PB_LOG_PREFIX=mesa
@@ -19,6 +20,12 @@ prefix="/opt/mesa-$MESA_VERSION"
 w="$BUILD/mesa"
 fresh_dir "$w/src"
 tar -xf "$SRC/mesa-$MESA_VERSION.tar.xz" -C "$w/src" --strip-components=1
+# our fixes (e.g. Zink without robustness2.nullDescriptor for Mali through Venus): mesa-<major>-pmbos-*.patch
+for pf in "$PB/patches/mesa-${MESA_VERSION%%.*}-pmbos-"*.patch; do
+    [ -f "$pf" ] || continue
+    log "applying $(basename "$pf")"
+    (cd "$w/src" && patch -p1 --fuzz=0 < "$pf") || die "patch $(basename "$pf") failed"
+done
 
 log "meson setup"
 PATH="/opt/pb-venv/bin:$PATH" "$MESON" setup "$w/build" "$w/src" \

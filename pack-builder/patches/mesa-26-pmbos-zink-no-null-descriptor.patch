@@ -1,0 +1,315 @@
+zink: placeholder descriptors for devices without robustness2.nullDescriptor (PMB OS)
+
+Since Mesa 24.1 Zink refuses devices without VK_EXT/KHR_robustness2 nullDescriptor. Mali proprietary drivers
+(used through Venus on Android) don't have it, so OpenGL was impossible there. Instead of null descriptors,
+such devices now get real placeholder resources per context (like Zink did before 24.1 with its dummy
+surface / buffer view): a zero-filled 64 KiB buffer (UBO / SSBO / vertex buffer / texel buffers through an
+RGBA8 buffer view), a zero-cleared 1x1 RGBA8 texture kept in GENERAL layout (sampled + storage images) and a
+nearest/clamp sampler for unbound sampler states. Unbound vertex buffers read with stride 0 where the stride
+is dynamic. Features that write null descriptors with no place for a placeholder are disabled on such
+devices: descriptor-buffer mode, bindless textures and fbfetch.
+
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -102,6 +102,101 @@
+ static void
+ image_handle_residency(struct zink_context *ctx, struct zink_bindless_descriptor *bd, unsigned paccess, bool resident);
+ 
++/* placeholders for devices without robustness2.nullDescriptor: see zink_context::null_desc */
++static void
++destroy_null_descriptors(struct zink_context *ctx)
++{
++   struct zink_screen *screen = zink_screen(ctx->base.screen);
++   if (ctx->null_desc.sampler)
++      VKSCR(DestroySampler)(screen->dev, ctx->null_desc.sampler, NULL);
++   if (ctx->null_desc.imageview)
++      VKSCR(DestroyImageView)(screen->dev, ctx->null_desc.imageview, NULL);
++   if (ctx->null_desc.bufferview)
++      VKSCR(DestroyBufferView)(screen->dev, ctx->null_desc.bufferview, NULL);
++   pipe_resource_reference(&ctx->null_desc.texture, NULL);
++   pipe_resource_reference(&ctx->null_desc.buffer, NULL);
++   memset(&ctx->null_desc, 0, sizeof(ctx->null_desc));
++}
++
++static bool
++create_null_descriptors(struct zink_context *ctx)
++{
++   struct zink_screen *screen = zink_screen(ctx->base.screen);
++   /* big enough for any UBO range a shader declares and for a few vertices at small strides */
++   const unsigned buffer_size = 65536;
++
++   ctx->null_desc.buffer = pipe_buffer_create(&screen->base,
++      PIPE_BIND_VERTEX_BUFFER | PIPE_BIND_CONSTANT_BUFFER | PIPE_BIND_SHADER_BUFFER |
++      PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHADER_IMAGE, PIPE_USAGE_DEFAULT, buffer_size);
++   struct pipe_resource templ = {0};
++   templ.target = PIPE_TEXTURE_2D;
++   templ.format = PIPE_FORMAT_R8G8B8A8_UNORM;
++   templ.width0 = templ.height0 = 1;
++   templ.depth0 = templ.array_size = 1;
++   templ.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHADER_IMAGE;
++   templ.usage = PIPE_USAGE_DEFAULT;
++   ctx->null_desc.texture = screen->base.resource_create(&screen->base, &templ);
++   if (!ctx->null_desc.buffer || !ctx->null_desc.texture)
++      goto fail;
++   struct zink_resource *buf = zink_resource(ctx->null_desc.buffer);
++   struct zink_resource *tex = zink_resource(ctx->null_desc.texture);
++
++   VkBufferViewCreateInfo bvci = {0};
++   bvci.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
++   bvci.buffer = buf->obj->buffer;
++   bvci.format = VK_FORMAT_R8G8B8A8_UNORM;
++   bvci.offset = 0;
++   bvci.range = VK_WHOLE_SIZE;
++   if (VKSCR(CreateBufferView)(screen->dev, &bvci, NULL, &ctx->null_desc.bufferview) != VK_SUCCESS)
++      goto fail;
++
++   VkImageViewCreateInfo ivci = {0};
++   ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++   ivci.image = tex->obj->image;
++   ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
++   ivci.format = VK_FORMAT_R8G8B8A8_UNORM;
++   ivci.components.r = ivci.components.g = ivci.components.b = ivci.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
++   ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++   ivci.subresourceRange.levelCount = 1;
++   ivci.subresourceRange.layerCount = 1;
++   if (VKSCR(CreateImageView)(screen->dev, &ivci, NULL, &ctx->null_desc.imageview) != VK_SUCCESS)
++      goto fail;
++
++   VkSamplerCreateInfo sci = {0};
++   sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
++   sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
++   sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++   sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++   sci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
++   if (VKSCR(CreateSampler)(screen->dev, &sci, NULL, &ctx->null_desc.sampler) != VK_SUCCESS)
++      goto fail;
++
++   /* GL: loads from unbound images / buffers return 0 */
++   static const uint32_t zeros[1024] = {0};
++   for (unsigned off = 0; off < buffer_size; off += sizeof(zeros))
++      pipe_buffer_write(&ctx->base, ctx->null_desc.buffer, off, sizeof(zeros), zeros);
++   union pipe_color_union color = {0};
++   struct pipe_box box = {0};
++   box.width = box.height = box.depth = 1;
++   ctx->base.clear_texture(&ctx->base, ctx->null_desc.texture, 0, &box, &color);
++   /* GENERAL is valid for both sampled and storage use; the texture is never bound any other way */
++   screen->image_barrier(ctx, tex, VK_IMAGE_LAYOUT_GENERAL,
++                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++                         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
++   screen->buffer_barrier(ctx, buf,
++                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT |
++                          VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
++                          VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
++                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
++   return true;
++
++fail:
++   mesa_loge("ZINK: failed to create placeholder descriptors");
++   destroy_null_descriptors(ctx);
++   return false;
++}
++
+ static void
+ zink_context_destroy(struct pipe_context *pctx)
+ {
+@@ -176,6 +271,7 @@
+       util_blitter_destroy(ctx->blitter);
+ 
+    pipe_resource_reference(&ctx->dummy_xfb_buffer, NULL);
++   destroy_null_descriptors(ctx);
+    zink_resource_reference(&ctx->swapchain, NULL);
+ 
+    zink_descriptors_deinit_bindless(ctx);
+@@ -734,9 +830,13 @@
+          warned = true;
+       }
+ #endif
+-   } else {
++   } else if (likely(!ctx->null_desc.buffer)) {
+       ctx->di.t.ubos[shader][slot].buffer = VK_NULL_HANDLE;
+       ctx->di.t.ubos[shader][slot].range = VK_WHOLE_SIZE;
++   } else {
++      ctx->di.t.ubos[shader][slot].buffer = zink_resource(ctx->null_desc.buffer)->obj->buffer;
++      ctx->di.t.ubos[shader][slot].offset = 0;
++      ctx->di.t.ubos[shader][slot].range = VK_WHOLE_SIZE;
+    }
+    return res;
+ }
+@@ -763,9 +863,13 @@
+    if (res) {
+       ctx->di.t.ssbos[shader][slot].buffer = res->obj->buffer;
+       ctx->di.t.ssbos[shader][slot].range = ctx->ssbos[shader][slot].buffer_size;
+-   } else {
++   } else if (likely(!ctx->null_desc.buffer)) {
+       ctx->di.t.ssbos[shader][slot].buffer = VK_NULL_HANDLE;
+       ctx->di.t.ssbos[shader][slot].range = VK_WHOLE_SIZE;
++   } else {
++      ctx->di.t.ssbos[shader][slot].buffer = zink_resource(ctx->null_desc.buffer)->obj->buffer;
++      ctx->di.t.ssbos[shader][slot].offset = 0;
++      ctx->di.t.ssbos[shader][slot].range = VK_WHOLE_SIZE;
+    }
+    return res;
+ }
+@@ -810,6 +914,11 @@
+             }
+          }
+       }
++   } else if (unlikely(ctx->null_desc.buffer)) {
++      /* no db mode without nullDescriptor */
++      ctx->di.textures[shader][slot].imageView = ctx->null_desc.imageview;
++      ctx->di.textures[shader][slot].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++      ctx->di.t.tbos[shader][slot] = ctx->null_desc.bufferview;
+    } else {
+       ctx->di.textures[shader][slot].imageView = VK_NULL_HANDLE;
+       ctx->di.textures[shader][slot].imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+@@ -852,6 +961,11 @@
+          ctx->di.images[shader][slot].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+          ctx->di.images[shader][slot].imageView = surface->image_view;
+       }
++   } else if (unlikely(ctx->null_desc.buffer)) {
++      ctx->di.images[shader][slot].sampler = VK_NULL_HANDLE;
++      ctx->di.images[shader][slot].imageView = ctx->null_desc.imageview;
++      ctx->di.images[shader][slot].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++      ctx->di.t.texel_images[shader][slot] = ctx->null_desc.bufferview;
+    } else {
+       memset(&ctx->di.images[shader][slot], 0, sizeof(ctx->di.images[shader][slot]));
+       if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB) {
+@@ -902,7 +1016,7 @@
+                ctx->di.textures[shader][start_slot + i].sampler = state->sampler_clamped;
+          }
+       } else {
+-         ctx->di.textures[shader][start_slot + i].sampler = VK_NULL_HANDLE;
++         ctx->di.textures[shader][start_slot + i].sampler = ctx->null_desc.sampler;
+       }
+    }
+    ctx->di.num_samplers[shader] = start_slot + num_samplers;
+@@ -1622,6 +1736,8 @@
+ {
+    VkBuffer buffers[PIPE_MAX_ATTRIBS];
+    VkDeviceSize buffer_offsets[PIPE_MAX_ATTRIBS];
++   VkDeviceSize null_strides[PIPE_MAX_ATTRIBS];
++   bool have_null = false;
+    struct zink_vertex_elements_state *elems = ctx->element_state;
+ 
+    for (unsigned i = 0; i < elems->hw_state.num_bindings; i++) {
+@@ -1632,6 +1748,11 @@
+          assert(res->obj->buffer);
+          buffers[i] = res->obj->buffer;
+          buffer_offsets[i] = vb->buffer_offset;
++      } else if (unlikely(ctx->null_desc.buffer)) {
++         /* placeholder: every vertex reads the same zeros (stride 0 where the stride is dynamic) */
++         buffers[i] = zink_resource(ctx->null_desc.buffer)->obj->buffer;
++         buffer_offsets[i] = 0;
++         have_null = true;
+       } else {
+          buffers[i] = VK_NULL_HANDLE;
+          buffer_offsets[i] = 0;
+@@ -1639,10 +1760,18 @@
+    }
+ 
+    if (have_dynamic_stride) {
++      const VkDeviceSize *strides = elems->hw_state.b.strides;
++      if (unlikely(have_null)) {
++         for (unsigned i = 0; i < elems->hw_state.num_bindings; i++) {
++            const struct pipe_vertex_buffer *vb = vbuffers + elems->hw_state.binding_map[i];
++            null_strides[i] = vb->buffer.resource ? strides[i] : 0;
++         }
++         strides = null_strides;
++      }
+       if (elems->hw_state.num_bindings)
+          VKCTX(CmdBindVertexBuffers2)(ctx->bs->cmdbuf, 0,
+                                       elems->hw_state.num_bindings,
+-                                      buffers, buffer_offsets, NULL, elems->hw_state.b.strides);
++                                      buffers, buffer_offsets, NULL, strides);
+    } else if (elems->hw_state.num_bindings)
+       VKCTX(CmdBindVertexBuffers2)(ctx->bs->cmdbuf, 0,
+                                   elems->hw_state.num_bindings,
+@@ -6222,6 +6351,9 @@
+    if (!ctx->bs)
+       goto fail;
+ 
++   if (!is_copy_only && !screen->info.rb2_feats.nullDescriptor && !create_null_descriptors(ctx))
++      goto fail;
++
+    if (screen->compact_descriptors)
+       ctx->invalidate_descriptor_state = zink_context_invalidate_descriptor_state_compact;
+    else
+@@ -6251,6 +6383,7 @@
+             }
+          }
+          for (unsigned j = 0; j < ARRAY_SIZE(ctx->di.textures[i]); j++) {
++            ctx->di.textures[i][j].sampler = ctx->null_desc.sampler;
+             update_descriptor_state_sampler(ctx, i, j, NULL);
+             if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB)
+                ctx->di.db.tbos[i][j].sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT;
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -786,6 +786,9 @@
+ #else
+    caps->fbfetch = screen->info.have_KHR_dynamic_rendering_local_read;
+ #endif
++   /* the fbfetch input attachment descriptor is written with a null view while unused */
++   if (!screen->info.rb2_feats.nullDescriptor)
++      caps->fbfetch = 0;
+    caps->fbfetch_coherent = caps->fbfetch && screen->info.have_EXT_rasterization_order_attachment_access;
+ 
+    caps->memobj =
+@@ -1026,6 +1029,8 @@
+    caps->primitive_restart = true;
+ 
+    caps->bindless_texture =
++      /* freed bindless handles are zeroed to null descriptors */
++      screen->info.rb2_feats.nullDescriptor &&
+       (zink_descriptor_mode != ZINK_DESCRIPTOR_MODE_DB ||
+        (screen->info.db_props.maxDescriptorBufferBindings >= 2 &&
+         screen->info.db_props.maxSamplerDescriptorBufferBindings >= 2)) &&
+@@ -3604,8 +3609,11 @@
+    }
+ 
+    if (!screen->info.rb2_feats.nullDescriptor) {
+-      mesa_loge("Zink requires the nullDescriptor feature of KHR/EXT robustness2.");
+-      goto fail;
++      /* unbound descriptors / vertex buffers get placeholder resources instead (zink_context: null_desc);
++       * features that can't work that way (descriptor buffers, bindless, fbfetch) are disabled
++       */
++      if (!screen->driver_name_is_inferred)
++         mesa_logw("ZINK: no robustness2.nullDescriptor, using placeholder descriptors");
+    }
+ 
+    if (zink_set_driver_strings(screen)) {
+@@ -3828,6 +3836,14 @@
+    }
+ 
+    bool can_db = true;
++   if (!screen->info.rb2_feats.nullDescriptor) {
++      if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB) {
++         if (!screen->driver_name_is_inferred)
++            mesa_loge("Cannot use db descriptor mode without robustness2.nullDescriptor");
++         goto fail;
++      }
++      can_db = false;
++   }
+    {
+       if (!screen->info.have_EXT_descriptor_buffer) {
+          if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB) {
+--- a/src/gallium/drivers/zink/zink_types.h
++++ b/src/gallium/drivers/zink/zink_types.h
+@@ -1991,6 +1991,17 @@
+ 
+    struct pipe_resource *dummy_xfb_buffer;
+ 
++   /* placeholders written instead of null descriptors when the device lacks robustness2.nullDescriptor
++    * (e.g. Mali proprietary drivers through Venus): reads return zeros, writes land in scratch memory
++    */
++   struct {
++      struct pipe_resource *buffer;   /* zero-filled; UBO / SSBO / vertex buffer / texel buffer storage */
++      struct pipe_resource *texture;  /* 1x1 RGBA8, zero-filled, kept in VK_IMAGE_LAYOUT_GENERAL */
++      VkBufferView bufferview;        /* R8G8B8A8_UNORM view of buffer: uniform + storage texel buffers */
++      VkImageView imageview;          /* 2D view of texture: sampled + storage images */
++      VkSampler sampler;              /* for combined image samplers without a bound sampler state */
++   } null_desc;
++
+    unsigned buffer_rebind_counter;
+    unsigned image_rebind_counter;
+ 
