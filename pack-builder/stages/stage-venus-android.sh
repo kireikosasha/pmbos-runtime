@@ -27,6 +27,7 @@ TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 WORK="${WORK:-$PWD/work/venus-android}"
 OUT="${OUT:-$PWD/work/dist}"
 MESON="${MESON:-meson}"
+# virglrenderer's meson runs python scripts that need PyYAML (and mako): install them next to meson
 command -v "$MESON" >/dev/null || die "meson missing"
 command -v ninja >/dev/null || die "ninja missing"
 

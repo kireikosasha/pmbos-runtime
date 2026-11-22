@@ -290,4 +290,26 @@ mv -f "$STAGE/index.json" "$OUT/index.json.tmp"
 mv -f "$OUT/index.json.tmp" "$OUT/index.json"
 rm -rf "$STAGE"
 log "bundle ready: $OUT ($(wc -l < "$OUT/SHA256SUMS" | tr -d ' ') archives, $((total / 1048576)) MiB)"
+
+# ---- Venus server for Android (GPU acceleration on Mali & co): not a runtime pack. Its two executables go into the
+# APK's jniLibs (Android only executes files from nativeLibraryDir). Optional: releases before packs-v6 have none.
+# Downloaded into pmbos/build/venus-dl (kept: build output, ignored by git).
+VIRGL_VERSION="$(sed -n 's/^: "${VIRGL_VERSION:=\(.*\)}"$/\1/p' "$HERE/../versions.env" | head -n1)"
+if [ "$DRY" = 0 ] && [ -n "$VIRGL_VERSION" ]; then
+    vn="venus-android-$VIRGL_VERSION"
+    vdl="$MOD/build/venus-dl"
+    mkdir -p "$vdl"
+    if curl -fsSL "${CURL_RETRY[@]}" -o "$vdl/$vn.tar.xz" "$BASE/$vn.tar.xz" 2>/dev/null; then
+        jni="$MOD/src/main/jniLibs/arm64-v8a"
+        mkdir -p "$jni"
+        tar -xJf "$vdl/$vn.tar.xz" -C "$vdl" || die "$vn.tar.xz is damaged"
+        for f in libpmbvenus.so libpmbvenusrs.so; do
+            [ -f "$vdl/$vn/$f" ] || die "$vn.tar.xz has no $f"
+            cp -f "$vdl/$vn/$f" "$jni/$f"
+        done
+        log "Venus server ($vn) -> $jni (libpmbvenus.so, libpmbvenusrs.so)"
+    else
+        log "no $vn.tar.xz on this release: the APK keeps its current Venus server (if any)"
+    fi
+fi
 log "next: ./gradlew :app:assembleDebug   (the APK grows by about that much; see pmbos/README.md)"
