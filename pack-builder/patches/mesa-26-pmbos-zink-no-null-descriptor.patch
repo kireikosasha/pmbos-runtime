@@ -88,10 +88,10 @@ devices: descriptor-buffer mode, bindless textures and fbfetch.
 +   static const uint32_t zeros[1024] = {0};
 +   for (unsigned off = 0; off < buffer_size; off += sizeof(zeros))
 +      pipe_buffer_write(&ctx->base, ctx->null_desc.buffer, off, sizeof(zeros), zeros);
-+   union pipe_color_union color = {0};
++   /* an upload, not clear_texture: that renders into the texture, which isn't a render target */
 +   struct pipe_box box = {0};
 +   box.width = box.height = box.depth = 1;
-+   ctx->base.clear_texture(&ctx->base, ctx->null_desc.texture, 0, &box, &color);
++   ctx->base.texture_subdata(&ctx->base, ctx->null_desc.texture, 0, PIPE_MAP_WRITE, &box, zeros, 4, 4);
 +   /* GENERAL is valid for both sampled and storage use; the texture is never bound any other way */
 +   screen->image_barrier(ctx, tex, VK_IMAGE_LAYOUT_GENERAL,
 +                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
