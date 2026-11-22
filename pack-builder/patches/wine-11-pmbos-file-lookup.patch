@@ -1,0 +1,168 @@
+PMB OS: file name lookups without reading whole directories (Android storage).
+
+Windows file names are case-insensitive. On a case-sensitive file system Wine therefore reads the whole directory
+whenever a name is not found exactly as spelled - for every file that is being created and for every DLL, module or
+config file a program merely probes for. On Android's shared storage (/storage/emulated: a FUSE file system served by
+the MediaProvider daemon, about 0.2 ms per directory entry) that made creating files in a directory of 1000 run at
+6 files per second and a Ren'Py game take over a minute to start; yet that file system matches names in any case by
+itself, so the search is pointless there.
+
+- FUSE file systems are asked once (an existing entry is looked up under a name with the other case) and the answer
+  is remembered per file system: no directory search on the case-insensitive ones, and no EXT2_IOC_GETFLAGS ioctl on
+  FUSE (Android's SELinux policy denies and logs it).
+- The short (8.3) name search runs only for names that can be Wine's own hashed short names ("ABCD~XYZ.EXT"). It used
+  to run for every name that merely fits 8.3 ("site.py"), which defeats the shortcut for case-insensitive file systems
+  (also ext4 / f2fs casefold directories, which PMB OS uses for the Windows prefix).
+- The VFAT_IOCTL_READDIR_BOTH ioctl is no longer tried on every directory that is listed or searched: there are no
+  VFAT volumes here, and each attempt on shared storage is denied and written to the audit log.
+
+--- a/dlls/ntdll/unix/file.c	2026-11-22 22:05:28.703015300 +0100
++++ b/dlls/ntdll/unix/file.c	2026-11-22 22:06:29.864964400 +0100
+@@ -1246,6 +1246,84 @@
+ }
+ #endif
+ 
++#ifdef __linux__
++/* PMB OS: FUSE file systems that look names up case-insensitively by themselves. Android's shared storage
++ * (/storage/emulated, served by the MediaProvider FUSE daemon) is one: every lookup already matches any case, and
++ * reading a directory through the daemon costs about 0.2 ms per entry. Stock Wine does not know, so every file that
++ * is not found there (each file being created, each DLL / module probe) made it read the whole directory: creating
++ * files in a directory of 1000 ran at 6 files per second. The answer is found once per file system by looking an
++ * existing entry up under a name with the other case, and remembered. */
++static pthread_mutex_t fuse_case_mutex = PTHREAD_MUTEX_INITIALIZER;
++static struct { dev_t dev; BOOLEAN sensitive; } fuse_case_cache[32];
++static unsigned int fuse_case_count;
++
++/* the remembered answer for a FUSE file system: 1 = case sensitive, 0 = insensitive, -1 = not known yet */
++static int fuse_case_lookup( dev_t dev )
++{
++    unsigned int i;
++    int known = -1;
++
++    mutex_lock( &fuse_case_mutex );
++    for (i = 0; i < fuse_case_count; i++)
++        if (fuse_case_cache[i].dev == dev) known = fuse_case_cache[i].sensitive;
++    mutex_unlock( &fuse_case_mutex );
++    return known;
++}
++
++static BOOLEAN get_fuse_case_sensitivity( int fd )
++{
++    struct stat st, st1, st2;
++    struct dirent *de;
++    unsigned int i;
++    int dfd, known;
++    DIR *dir;
++
++    if (fstat( fd, &st )) return TRUE;
++    if ((known = fuse_case_lookup( st.st_dev )) != -1) return known;
++    if (!fstatat( fd, ".ciopfs", &st1, AT_NO_AUTOMOUNT )) return FALSE;  /* CIOPFS marks its directories */
++
++    /* find an entry with a letter in its name and look it up with the case of the letters flipped */
++    if ((dfd = openat( fd, ".", O_RDONLY | O_DIRECTORY | O_NONBLOCK )) == -1) return TRUE;
++    if (!(dir = fdopendir( dfd )))
++    {
++        close( dfd );
++        return TRUE;
++    }
++    while (known == -1 && (de = readdir( dir )))
++    {
++        char flipped[sizeof(de->d_name)];
++        BOOL changed = FALSE;
++        size_t len = strlen( de->d_name );
++
++        if (len >= sizeof(flipped)) continue;
++        for (i = 0; i <= len; i++)
++        {
++            char c = de->d_name[i];
++            if (c >= 'a' && c <= 'z') { c -= 'a' - 'A'; changed = TRUE; }
++            else if (c >= 'A' && c <= 'Z') { c += 'a' - 'A'; changed = TRUE; }
++            flipped[i] = c;
++        }
++        if (!changed) continue;
++        if (fstatat( fd, de->d_name, &st1, AT_SYMLINK_NOFOLLOW )) continue;
++        if (fstatat( fd, flipped, &st2, AT_SYMLINK_NOFOLLOW )) known = TRUE;
++        else known = !(st1.st_dev == st2.st_dev && st1.st_ino == st2.st_ino);
++    }
++    closedir( dir );
++    if (known == -1) return TRUE;  /* nothing to test with: an empty directory is cheap to search anyway */
++
++    mutex_lock( &fuse_case_mutex );
++    if (fuse_case_count < ARRAY_SIZE(fuse_case_cache))
++    {
++        fuse_case_cache[fuse_case_count].dev = st.st_dev;
++        fuse_case_cache[fuse_case_count].sensitive = known;
++        fuse_case_count++;
++    }
++    mutex_unlock( &fuse_case_mutex );
++    TRACE( "FUSE file system %lx is case %s\n", (unsigned long)st.st_dev, known ? "sensitive" : "insensitive" );
++    return known;
++}
++#endif
++
+ /***********************************************************************
+  *           get_dir_case_sensitivity_stat
+  *
+@@ -1309,16 +1387,18 @@
+     struct stat st;
+     int fd, flags;
+ 
++    /* PMB OS: a FUSE file system that was already examined needs no more than this */
++    if (!fstatat( root_fd, dir, &st, 0 ) && (flags = fuse_case_lookup( st.st_dev )) != -1) return flags;
++
+     if ((fd = openat( root_fd, dir, O_RDONLY | O_NONBLOCK )) == -1)
+         return TRUE;
+ 
+-    if (ioctl( fd, EXT2_IOC_GETFLAGS, &flags ) != -1 && (flags & EXT4_CASEFOLD_FL))
++    if (fstatfs( fd, &stfs ) == 0 && stfs.f_type == 0x65735546 /* FUSE_SUPER_MAGIC */)
+     {
+-        sens = FALSE;
++        /* PMB OS: FUSE first, without the ioctl (Android's SELinux policy denies and logs it on shared storage) */
++        sens = get_fuse_case_sensitivity( fd );
+     }
+-    else if (fstatfs( fd, &stfs ) == 0 &&                          /* CIOPFS is case insensitive.  Instead of */
+-             stfs.f_type == 0x65735546 /* FUSE_SUPER_MAGIC */ &&   /* parsing mtab to discover if the FUSE FS */
+-             fstatat( fd, ".ciopfs", &st, AT_NO_AUTOMOUNT ) == 0)  /* is CIOPFS, look for .ciopfs in the dir. */
++    else if (ioctl( fd, EXT2_IOC_GETFLAGS, &flags ) != -1 && (flags & EXT4_CASEFOLD_FL))
+     {
+         sens = FALSE;
+     }
+@@ -2673,7 +2753,7 @@
+ {
+     NTSTATUS status;
+ 
+-#ifdef VFAT_IOCTL_READDIR_BOTH
++#if 0 /* PMB OS: no VFAT volumes; Android's SELinux policy denies and logs this ioctl on every directory listed */
+     if (!(status = read_directory_data_vfat( data, fd, mask ))) return status;
+ #endif
+ 
+@@ -2977,15 +3057,17 @@
+     /* check if it fits in 8.3 so that we don't look for short names if we won't need them */
+ 
+     is_name_8_dot_3 = is_legal_8dot3_name( name, length );
+-#ifndef VFAT_IOCTL_READDIR_BOTH
++    /* PMB OS: no VFAT volumes here (the ioctl below is denied and logged by Android's SELinux policy on every
++     * directory it is tried on), so the only short names are the hashed ones Wine makes up itself ("ABCD~XYZ.EXT").
++     * An ordinary short name like "site.py" that is not found then needs no search of the whole directory on a
++     * case-insensitive file system. */
+     is_name_8_dot_3 = is_name_8_dot_3 && length >= 8 && name[4] == '~';
+-#endif
+ 
+     if (!is_name_8_dot_3 && !get_dir_case_sensitivity( root_fd, unix_name )) goto not_found;
+ 
+     /* now look for it through the directory */
+ 
+-#ifdef VFAT_IOCTL_READDIR_BOTH
++#if 0 /* PMB OS: see above */
+     if (is_name_8_dot_3)
+     {
+         int fd = openat( root_fd, unix_name, O_RDONLY | O_DIRECTORY );
+@@ -3031,7 +3113,7 @@
+         }
+         /* fall through to normal handling */
+     }
+-#endif /* VFAT_IOCTL_READDIR_BOTH */
++#endif /* PMB OS */
+ 
+     if ((fd = openat( root_fd, unix_name, O_RDONLY )) == -1) return errno_to_status( errno );
+     if (!(dir = fdopendir( fd )))
