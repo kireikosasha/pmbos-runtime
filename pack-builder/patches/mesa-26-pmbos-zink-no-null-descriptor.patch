@@ -87,7 +87,7 @@ devices: descriptor-buffer mode, bindless textures and fbfetch.
 +   /* GL: loads from unbound images / buffers return 0 */
 +   static const uint32_t zeros[1024] = {0};
 +   for (unsigned off = 0; off < buffer_size; off += sizeof(zeros))
-+      pipe_buffer_write(&ctx->base, ctx->null_desc.buffer, off, sizeof(zeros), zeros);
++      pipe_buffer_write_nooverlap(&ctx->base, ctx->null_desc.buffer, off, sizeof(zeros), zeros);
 +   /* an upload, not clear_texture: that renders into the texture, which isn't a render target */
 +   struct pipe_box box = {0};
 +   box.width = box.height = box.depth = 1;
