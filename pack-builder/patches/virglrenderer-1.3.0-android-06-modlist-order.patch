@@ -1,0 +1,24 @@
+venus (Android): restore the DRM format modifier list at its original place in the chain
+
+The Termux Android patch hides VkDrmFormatModifierPropertiesListEXT from the device's driver during
+vkGetPhysicalDeviceFormatProperties2 and re-inserted it at the head of the chain afterwards. The reply is
+encoded in chain order and the guest (Mesa venus) decodes it against its own chain, so a reordered chain -
+e.g. Zink's [FormatProperties3 -> DrmFormatModifierPropertiesList] - made the guest walk off the end of its
+chain and crash (NULL dereference in vn_decode_VkFormatProperties2_pnext). Put it back where it was. (PMB OS)
+
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -738,8 +738,11 @@
+ 
+ #if defined(__TERMUX__)
+    if (mod_list) {
+-      mod_list->pNext = args->pFormatProperties->pNext;
+-      args->pFormatProperties->pNext = mod_list;
++      /* put it back where it was, not at the head: the guest decodes the reply chain in its own order */
++      VkBaseOutStructure *prev = (VkBaseOutStructure *)args->pFormatProperties;
++      while (prev->pNext != (VkBaseOutStructure *)mod_list->pNext)
++         prev = prev->pNext;
++      prev->pNext = (VkBaseOutStructure *)mod_list;
+    }
+ #endif
+ }
