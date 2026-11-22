@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Stage "mesa" (arm64 container): Mesa for arm64 glibc
 #   - Vulkan: Turnip (freedreno) on the Android KGSL kernel interface, X11 WSI
+#   - Vulkan: Venus (virtio) over the vtest socket of the Android-side virglrenderer (venus-android: Mali and other
+#     non-Adreno GPUs run the commands on the device's own Vulkan driver)
 #   - OpenGL / EGL: Zink on top of Turnip (no GLVND: libGL.so.1 / libEGL.so.1 are Mesa's)
 # installed under /opt/mesa-<ver> -> pack "mesa-<ver>" (type vulkan-driver, installDir imagefs).
 # The Vulkan ICD manifest uses the @ROOTFS@ token (textPatch) for its absolute library path.
@@ -22,7 +24,7 @@ log "meson setup"
 PATH="/opt/pb-venv/bin:$PATH" "$MESON" setup "$w/build" "$w/src" \
     --prefix="$prefix" --libdir=lib --buildtype=release -Db_ndebug=true -Dstrip=true \
     -Dplatforms=x11 \
-    -Dvulkan-drivers=freedreno -Dfreedreno-kmds=kgsl \
+    -Dvulkan-drivers=freedreno,virtio -Dfreedreno-kmds=kgsl \
     -Dgallium-drivers=zink \
     -Dopengl=true -Dglx=dri -Degl=enabled -Dgles1=disabled -Dgles2=enabled \
     -Dgbm=disabled -Dglvnd=disabled -Dllvm=disabled \
@@ -44,14 +46,17 @@ t="$root/opt/mesa-$MESA_VERSION"
 rm -rf "$t/include" "$t/lib/pkgconfig" "$t/share/drirc.d"
 
 [ -f "$t/lib/libvulkan_freedreno.so" ] || die "libvulkan_freedreno.so not built"
+[ -f "$t/lib/libvulkan_virtio.so" ] || die "libvulkan_virtio.so (Venus) not built"
 [ -e "$t/lib/libEGL.so.1" ] || die "libEGL.so.1 not built"
 [ -e "$t/lib/libGL.so.1" ] || die "libGL.so.1 not built"
 
-# Vulkan ICD manifest with an install-time absolute path
+# Vulkan ICD manifests with an install-time absolute path
 icd_dir="$t/share/vulkan/icd.d"
-src_icd="$(find "$icd_dir" -name 'freedreno_icd*.json' -print -quit)"
-[ -n "$src_icd" ] || die "freedreno ICD manifest not generated"
-python3 - "$src_icd" "$icd_dir/freedreno_icd.aarch64.json" "@ROOTFS@$prefix/lib/libvulkan_freedreno.so" <<'PY'
+for drv in freedreno virtio; do
+src_icd="$(find "$icd_dir" -name "${drv}_icd*.json" ! -name "${drv}_icd.aarch64.json" -print -quit)"
+[ -n "$src_icd" ] || src_icd="$(find "$icd_dir" -name "${drv}_icd*.json" -print -quit)"
+[ -n "$src_icd" ] || die "$drv ICD manifest not generated"
+python3 - "$src_icd" "$icd_dir/${drv}_icd.aarch64.json" "@ROOTFS@$prefix/lib/libvulkan_${drv}.so" <<'PY'
 import json, sys
 src, dst, lib = sys.argv[1:4]
 with open(src) as f:
@@ -66,9 +71,10 @@ if os.path.abspath(src) != os.path.abspath(dst):
     os.unlink(src)
 os.replace(dst + ".tmp", dst)
 PY
+done
 install -m 0644 "$w/src/docs/license.rst" "$t/share/LICENSE.mesa.rst"
 
 packdef "mesa-$MESA_VERSION" "$MESA_VERSION" vulkan-driver imagefs "imagefs" 1 1 \
-    "Mesa $MESA_VERSION: Turnip Vulkan (Adreno, KGSL) + Zink OpenGL/EGL, X11 WSI (opt/mesa-$MESA_VERSION)"
+    "Mesa $MESA_VERSION: Turnip Vulkan (Adreno, KGSL) + Venus Vulkan (other GPUs, via venus-android) + Zink OpenGL/EGL, X11 WSI (opt/mesa-$MESA_VERSION)"
 rm -rf "$w"
 log "mesa staged"

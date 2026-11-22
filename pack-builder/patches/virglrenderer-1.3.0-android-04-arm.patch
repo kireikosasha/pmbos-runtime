@@ -1,0 +1,14 @@
+PMB OS: taken from termux-packages (packages/virglrenderer-android/0012-fix-build-on-arm.patch, Apache-2.0 recipe; the patch
+itself follows virglrenderer's MIT license). Applied with -p1 to virglrenderer 1.3.0.
+Calling convention attribute on the debug callback.
+
+--- a/src/venus/vkr_instance.c
++++ b/src/venus/vkr_instance.c
+@@ -58,6 +58,7 @@
+    args->ret = count == ARRAY_SIZE(private_extensions) ? VK_SUCCESS : VK_INCOMPLETE;
+ }
+ 
++VKAPI_ATTR
+ static VkBool32
+ vkr_validation_callback(UNUSED VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
+                         UNUSED VkDebugUtilsMessageTypeFlagsEXT messageTypes,

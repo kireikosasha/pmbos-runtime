@@ -45,7 +45,7 @@ on:
         required: false
         default: ""
       rebuild:
-        description: "Stages built anew even when reuse_run is set (space separated; supported: wine)"
+        description: "Stages built anew even when reuse_run is set (space separated; supported: wine mesa)"
         type: string
         required: false
         default: ""
@@ -336,7 +336,7 @@ jobs:
           if-no-files-found: error
 
   mesa:
-    name: Mesa (arm64 Turnip + Zink)
+    name: Mesa (arm64 Turnip + Venus + Zink)
     needs: [plan, fetch]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
@@ -347,7 +347,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Reuse stage artifacts from an earlier run
         id: reuse
-        if: inputs.reuse_run != ''
+        if: inputs.reuse_run != '' && !contains(format(' {0} ', inputs.rebuild), ' mesa ')
         env:
           GH_TOKEN: ${{ github.token }}
           REUSE_RUN: ${{ inputs.reuse_run }}
@@ -618,6 +618,30 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
+  venus-android:
+    name: Venus server for Android (NDK, virglrenderer)
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tools (meson, ninja)
+        run: |
+          python3 -m venv /tmp/venus-venv
+          /tmp/venus-venv/bin/pip install --quiet meson==1.10.2 ninja==1.13.0
+          echo "/tmp/venus-venv/bin" >> "$GITHUB_PATH"
+      - name: Stage venus-android
+        env:
+          OUT: ${{ github.workspace }}/work/venus
+          WORK: ${{ runner.temp }}/venus-android
+        run: bash pack-builder/stages/stage-venus-android.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pb-venus-android
+          path: work/venus/venus-android-*.tar.xz
+          retention-days: 90
+          if-no-files-found: error
+
   package:
     name: Pack archives + verify (arm64)
     needs: [plan, imagefs, box64, mesa, mesa-sw, wine, repack]
@@ -689,7 +713,7 @@ jobs:
 
   publish:
     name: Index + GitHub Release
-    needs: [plan, package]
+    needs: [plan, package, venus-android]
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -719,6 +743,10 @@ jobs:
         with:
           name: pb-manifest
           path: work/build/manifest
+      - uses: actions/download-artifact@v4
+        with:
+          name: pb-venus-android
+          path: release-extra/venus
       - uses: actions/download-artifact@v4
         with:
           name: pb-src
@@ -752,6 +780,7 @@ jobs:
           bash "$CI_SH" publish "$TAG" "$PRERELEASE"
           work/dist/*.tar.xz work/dist/SHA256SUMS
           release-extra/SOURCES.txt "release-extra/pmbos-runtime-sources-$TAG.tar"
+          release-extra/venus/venus-android-*.tar.xz
           work/dist/index.json
       - name: Smoke test (download like the app, incl. releases/latest and Range)
         if: needs.plan.outputs.dry_run != 'true'
