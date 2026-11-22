@@ -1,0 +1,55 @@
+--- a/dlls/nsiproxy.sys/ndis.c	2026-11-22 01:53:50.078292300 +0100
++++ b/dlls/nsiproxy.sys/ndis.c	2026-11-22 01:53:50.027978900 +0100
+@@ -307,11 +307,52 @@
+     return entry;
+ }
+ 
++#ifdef SIOCGIFCONF
++/* PMB OS: if_nameindex() lists the interfaces over netlink (RTM_GETLINK), which Android denies to apps (EACCES), so
++ * it returns NULL there. Enumerate the interfaces that have an IPv4 address with SIOCGIFCONF instead (plain ioctls,
++ * allowed), and always offer the loopback interface. */
++static unsigned int update_if_table_ioctl( void )
++{
++    struct ifreq reqs[64];
++    struct ifconf ifc;
++    unsigned int append_count = 0, index;
++    char name[IFNAMSIZ];
++    int fd, i, count, have_lo = 0;
++
++    if ((fd = socket( AF_INET, SOCK_DGRAM, 0 )) == -1) return 0;
++    ifc.ifc_len = sizeof(reqs);
++    ifc.ifc_req = reqs;
++    count = ioctl( fd, SIOCGIFCONF, &ifc ) ? 0 : ifc.ifc_len / sizeof(struct ifreq);
++    close( fd );
++
++    for (i = 0; i < count; i++)
++    {
++        memcpy( name, reqs[i].ifr_name, IFNAMSIZ );
++        name[IFNAMSIZ - 1] = 0;
++        if (!strcmp( name, "lo" )) have_lo = 1;
++        if (!(index = if_nametoindex( name ))) continue;
++        if (!find_entry_from_index( index ) && add_entry( index, name )) ++append_count;
++    }
++    if (!have_lo && (index = if_nametoindex( "lo" )))
++    {
++        strcpy( name, "lo" );
++        if (!find_entry_from_index( index ) && add_entry( index, name )) ++append_count;
++    }
++    return append_count;
++}
++#endif
++
+ static unsigned int update_if_table( void )
+ {
+     struct if_nameindex *indices = if_nameindex(), *entry;
+     unsigned int append_count = 0;
+ 
++#ifdef SIOCGIFCONF
++    if (!indices) return update_if_table_ioctl();
++#else
++    if (!indices) return 0;
++#endif
++
+     for (entry = indices; entry->if_index; entry++)
+     {
+         if (!find_entry_from_index( entry->if_index ) && add_entry( entry->if_index, entry->if_name ))

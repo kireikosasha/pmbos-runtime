@@ -44,6 +44,11 @@ on:
         type: string
         required: false
         default: ""
+      rebuild:
+        description: "Stages built anew even when reuse_run is set (space separated; supported: wine)"
+        type: string
+        required: false
+        default: ""
       verify_wine:
         description: "Stage verify, wine --version under box64: auto = warn on failure, 1 = must pass, 0 = skip"
         type: choice
@@ -507,7 +512,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Reuse stage artifact from an earlier run
         id: reuse
-        if: inputs.reuse_run != ''
+        if: inputs.reuse_run != '' && !contains(format(' {0} ', inputs.rebuild), ' wine ')
         env:
           GH_TOKEN: ${{ github.token }}
           REUSE_RUN: ${{ inputs.reuse_run }}

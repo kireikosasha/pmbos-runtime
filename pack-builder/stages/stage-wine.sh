@@ -21,6 +21,11 @@ for v in $build_versions; do
     major="${v%%.*}"
     patchfile="$PB/patches/wine-$major-pmbos-tmpdir.patch"
     [ -f "$patchfile" ] || die "no wine patch for major version $major ($patchfile)"
+    # further PMB OS fixes for this major version (applied after the tmpdir patch, in name order)
+    extra_patches=()
+    for pf in "$PB/patches/wine-$major-pmbos-"*.patch; do
+        [ "$pf" = "$patchfile" ] || extra_patches+=("$pf")
+    done
     mono="$(getv WINE_MONO "$v")"
     prefix="/opt/wine-$v"
     w="$BUILD/wine/$v"
@@ -29,6 +34,10 @@ for v in $build_versions; do
     tar -xf "$SRC/wine-$v.tar.xz" -C "$w/src" --strip-components=1
     log "wine $v: applying $(basename "$patchfile")"
     (cd "$w/src" && patch -p1 --fuzz=0 < "$patchfile")
+    for pf in "${extra_patches[@]}"; do
+        log "wine $v: applying $(basename "$pf")"
+        (cd "$w/src" && patch -p1 --fuzz=0 < "$pf")
+    done
 
     log "wine $v: configure"
     (
