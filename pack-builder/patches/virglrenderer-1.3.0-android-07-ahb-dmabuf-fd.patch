@@ -1,0 +1,33 @@
+venus (Android): pick the AHardwareBuffer's dma-buf fd correctly
+
+vkr_gbm_bo_get_fd (Termux Android patch) chose the first native-handle fd whose lseek size was >= the buffer
+size, storing the result in a size_t: a failing lseek (-1, e.g. a vendor metadata fd that comes first in
+MediaTek gralloc handles) became SIZE_MAX and that fd was exported. vkr_device_memory_export_blob then
+rejected it ("mem dma_buf_size -1 < blob_size"), so no mappable memory could be shared with the guest.
+Skip fds that can't be sized and log the handle when none fits. (PMB OS)
+
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -243,13 +243,20 @@
+ 
+    const native_handle_t *bo_handle = bo->getNativeHandle(bo->base);
+    if (bo_handle) {
++      /* gralloc handles may carry several fds (vendor metadata first on some); the buffer is the dma-buf that
++       * is big enough. lseek fails (-1) on the others: that must not pass as a huge size_t.
++       */
+       for (int i = 0u; i < bo_handle->numFds; i++) {
+-         size_t size = lseek(bo_handle->data[i], 0, SEEK_END);
+-         if (size < bo->size)
++         const off_t size = lseek(bo_handle->data[i], 0, SEEK_END);
++         if (size < 0 || (uint64_t)size < bo->size)
+             continue;
+ 
+          return os_dupfd_cloexec(bo_handle->data[i]);
+       }
++      vkr_log("AHardwareBuffer of %" PRIu64 " bytes has no dma-buf fd that big (%d fds)", (uint64_t)bo->size,
++              bo_handle->numFds);
++      for (int i = 0u; i < bo_handle->numFds; i++)
++         vkr_log("  fd %d: lseek size %lld", i, (long long)lseek(bo_handle->data[i], 0, SEEK_END));
+    }
+ 
+    return -1;
