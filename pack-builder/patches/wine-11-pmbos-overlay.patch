@@ -1,0 +1,174 @@
+PMB OS: GPU-composed client windows (X property _PMBOS_OVERLAY, implemented by the PMB OS X server: Overlay.java).
+
+Wine renders OpenGL / Vulkan / Direct3D into an X "client window". When that window cannot simply sit inside the
+program's top-level X window - it belongs to another process (Chromium / NW.js / Electron / CEF GPU process), it has to
+be clipped by child windows, or it has another size than the place it is shown at (DPI scaling, emulated display modes
+of fullscreen games) - Wine keeps it off-screen and after EVERY frame copies it into the top-level with XCopyArea, or,
+when the sizes differ, reads it back and stretches it on the CPU. On a phone that costs more than rendering the frame.
+
+With this patch the client window just tells the X server where it belongs (target window, rectangle, visible region)
+and the server's compositor draws it there on the GPU, scaled if needed; nothing is copied or read back. The property is
+only rewritten when the placement changes. Without the root property _PMBOS_OVERLAY_SUPPORTED (any other X server)
+Wine behaves exactly as before.
+
+Also: a window of another process is always presented this way. Stock Wine leaves such a client window under its
+off-screen parent unless one of the other "offscreen" rules happens to apply, so cross-process rendering into a
+top-level window without child windows shows nothing.
+
+--- a/dlls/winex11.drv/init.c	2026-11-22 21:39:33.919301500 +0100
++++ b/dlls/winex11.drv/init.c	2026-11-22 21:40:01.399235900 +0100
+@@ -226,8 +226,46 @@
+     return ret > 0;
+ }
+ 
++/* PMB OS: the X server of PMB OS shows a client window inside another window by itself, scaled and clipped on the GPU,
++ * when the client window carries the _PMBOS_OVERLAY property (CARDINAL: flags, target window, x, y, width, height,
++ * [rect count, rects...]). Offscreen client surfaces then need no XCopyArea / read back + StretchBlt per frame. The
++ * server announces the feature with _PMBOS_OVERLAY_SUPPORTED on the root window. */
++#define PMBOS_OVERLAY_MAX_RECTS 64
++
++static BOOL pmbos_overlay_supported(void)
++{
++    static int supported = -1;
++
++    if (supported < 0)
++    {
++        Atom atom = XInternAtom( gdi_display, "_PMBOS_OVERLAY_SUPPORTED", True ), type;
++        unsigned long count, remaining;
++        unsigned char *data = NULL;
++        int format, ret = 0;
++
++        if (atom != None && !XGetWindowProperty( gdi_display, DefaultRootWindow( gdi_display ), atom, 0, 1, False,
++                                                 XA_CARDINAL, &type, &format, &count, &remaining, &data ))
++        {
++            if (type == XA_CARDINAL && format == 32 && count == 1 && *(long *)data >= 1) ret = 1;
++            if (data) XFree( data );
++        }
++        supported = ret;
++        TRACE( "_PMBOS_OVERLAY supported: %d\n", ret );
++    }
++    return supported;
++}
++
+ BOOL needs_offscreen_rendering( HWND hwnd )
+ {
++    if (pmbos_overlay_supported())
++    {
++        /* PMB OS: a window of another process (a browser's GPU process drawing into the browser window) can only be
++         * reached by presenting onto its X window; stock Wine leaves such a client window invisible unless another
++         * rule below happens to apply. */
++        struct x11drv_win_data *data = get_win_data( hwnd );
++        if (!data) return TRUE;
++        release_win_data( data );
++    }
+     if (NtUserGetDpiForWindow( hwnd ) != NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI )) return TRUE; /* needs DPI scaling */
+     if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow()) return TRUE; /* child window, needs compositing */
+     if (NtUserGetWindowRelative( hwnd, GW_CHILD )) return needs_client_window_clipping( hwnd ); /* window has children, needs compositing */
+@@ -276,8 +314,73 @@
+ 
+     HDC hdc_src;
+     HDC hdc_dst;
++
++    /* PMB OS: the _PMBOS_OVERLAY value last set on the client window (overlay_count longs; 0 = no property) */
++    long overlay[7 + 4 * PMBOS_OVERLAY_MAX_RECTS];
++    int overlay_count;
+ };
+ 
++static void pmbos_overlay_clear( struct x11drv_client_surface *surface )
++{
++    if (!surface->overlay_count) return;
++    surface->overlay_count = 0;
++    XDeleteProperty( gdi_display, surface->window, XInternAtom( gdi_display, "_PMBOS_OVERLAY", False ) );
++}
++
++/* Asks the X server to show the client window at dst inside target, clipped to region (relative to dst, NULL = all
++ * of it). Returns FALSE when the region is too complex for the property: the caller copies as stock Wine does. */
++static BOOL pmbos_overlay_set( struct x11drv_client_surface *surface, Window target, const RECT *dst, HRGN region )
++{
++    long data[7 + 4 * PMBOS_OVERLAY_MAX_RECTS];
++    int count = 6;
++
++    data[0] = 0;
++    data[1] = target;
++    data[2] = dst->left;
++    data[3] = dst->top;
++    data[4] = dst->right - dst->left;
++    data[5] = dst->bottom - dst->top;
++    if (data[4] <= 0 || data[5] <= 0)
++    {
++        pmbos_overlay_clear( surface );
++        return TRUE;
++    }
++    if (region)
++    {
++        RGNDATA *rgn = X11DRV_GetRegionData( region, 0 );
++        XRectangle *rects;
++        unsigned int i;
++
++        if (!rgn) return FALSE;
++        if (rgn->rdh.nCount > PMBOS_OVERLAY_MAX_RECTS)
++        {
++            free( rgn );
++            return FALSE;
++        }
++        rects = (XRectangle *)rgn->Buffer;
++        data[0] = 1;
++        data[count++] = rgn->rdh.nCount;
++        for (i = 0; i < rgn->rdh.nCount; i++)
++        {
++            data[count++] = rects[i].x;
++            data[count++] = rects[i].y;
++            data[count++] = rects[i].width;
++            data[count++] = rects[i].height;
++        }
++        free( rgn );
++    }
++    if (count != surface->overlay_count || memcmp( data, surface->overlay, count * sizeof(*data) ))
++    {
++        TRACE( "client window %lx shown in %lx at %s, %ld clip rects\n", surface->window, target,
++               wine_dbgstr_rect( dst ), data[0] ? data[6] : -1 );
++        memcpy( surface->overlay, data, count * sizeof(*data) );
++        surface->overlay_count = count;
++        XChangeProperty( gdi_display, surface->window, XInternAtom( gdi_display, "_PMBOS_OVERLAY", False ), XA_CARDINAL,
++                         32, PropModeReplace, (unsigned char *)data, count );
++    }
++    return TRUE;
++}
++
+ static struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client )
+ {
+     return CONTAINING_RECORD( client, struct x11drv_client_surface, client );
+@@ -305,6 +408,7 @@
+ 
+     TRACE( "%s\n", debugstr_client_surface( client ) );
+ 
++    pmbos_overlay_clear( surface );
+     if ((data = get_win_data( hwnd )))
+     {
+         detach_client_window( data, client_window );
+@@ -370,6 +474,7 @@
+ 
+     if (!offscreen)
+     {
++        pmbos_overlay_clear( surface );
+ #ifdef SONAME_LIBXCOMPOSITE
+         if (usexcomposite) pXCompositeUnredirectWindow( gdi_display, surface->window, CompositeRedirectManual );
+ #endif
+@@ -452,6 +557,17 @@
+         release_win_data( data );
+     }
+ 
++    if (pmbos_overlay_supported())
++    {
++        /* PMB OS: the X server composes the client window into the toplevel itself */
++        if (window && pmbos_overlay_set( surface, window, &rect_dst, region ))
++        {
++            XFlush( gdi_display );
++            goto done;
++        }
++        pmbos_overlay_clear( surface );
++    }
++
+     if (get_dc_drawable( surface->hdc_dst, &rect ) != window || !EqualRect( &rect, &rect_dst ))
+         set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
+     if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
