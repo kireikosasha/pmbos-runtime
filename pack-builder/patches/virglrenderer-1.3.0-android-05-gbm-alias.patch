@@ -1,0 +1,16 @@
+PMB OS: with the Android Vulkan patch (03) the dma_buf import branch of vkr_dispatch_vkAllocateMemory
+calls vkr_gbm_get_fd_info_from_allocation_info, which 03 only defines without __TERMUX__ (an implicit
+declaration, an error with NDK r27 clang). Alias it to the AHardwareBuffer allocation of 03.
+
+--- a/src/venus/vkr_device_memory.c	2026-11-22 07:17:16.731147400 +0100
++++ b/src/venus/vkr_device_memory.c	2026-11-22 07:17:16.859221000 +0100
+@@ -342,6 +342,9 @@
+    vkr_gbm_bo_destroy(bo);
+    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ }
++/* PMB OS: the dma_buf import path of vkr_dispatch_vkAllocateMemory still calls the GBM helper by its own name; on
++ * Android it is the AHardwareBuffer allocation above as well. */
++#define vkr_gbm_get_fd_info_from_allocation_info vkr_get_fd_info_from_allocation_info
+ #else
+ static inline VkResult
+ vkr_gbm_get_fd_info_from_allocation_info(UNUSED struct vkr_physical_device *physical_dev,
