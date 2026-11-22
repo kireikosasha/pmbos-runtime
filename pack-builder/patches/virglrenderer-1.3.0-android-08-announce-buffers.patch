@@ -1,0 +1,190 @@
+venus (Android): hand the AHardwareBuffers behind guest-exported memory to the app's compositor
+
+The guest gets only the dma-buf fd of exported memory, and its Vulkan WSI passes that fd on to the X server (DRI3)
+as a frame buffer. Android's EGL cannot import a bare dma-buf, and reading the buffer through a CPU mapping is slow
+(gralloc maps these buffers uncached: about 7 ms for a 1080p frame), which made the frame upload the most expensive
+step of presenting. The compositor needs the AHardwareBuffer itself: with it, it reads the frame from a GL buffer
+object that shares the memory (GL_EXT_external_buffer), a copy inside the GPU.
+
+For memory the guest driver itself asks to export (its swapchain buffers; ordinary host-visible allocations are not
+announced), the render server now sends the buffer over the unix socket named by PMBOS_AHB_SOCKET
+(AHardwareBuffer_sendHandleToUnixSocket, preceded by a header with the dma-buf's device and inode by which the
+X server finds it again), and a "gone" message when the memory is freed. Without the variable nothing changes.
+
+Also initializes fake_gbm_bo::base: on an allocation failure vkr_gbm_bo_destroy released an uninitialized pointer.
+(PMB OS)
+
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -232,6 +232,10 @@
+    pfnAHardwareBuffer_allocate allocate;
+    pfnAHardwareBuffer_release release;
+    pfnAHardwareBuffer_getNativeHandle getNativeHandle;
++   /* PMB OS: identity of the dma-buf announced to the app's compositor (pmbos_ahb_announce), if any */
++   bool announced;
++   uint64_t announced_dev;
++   uint64_t announced_ino;
+ };
+ #endif
+ 
+@@ -272,6 +276,130 @@
+ #endif
+ 
+ #if defined(__TERMUX__)
++/* PMB OS: hand the AHardwareBuffers behind memory the guest exports (its swapchain buffers) to the app's compositor.
++ *
++ * The guest only gets the buffer's dma-buf fd, and its Vulkan WSI passes that fd on to the X server (DRI3). Android's
++ * EGL cannot import a bare dma-buf, and reading the buffer through a CPU mapping is slow (uncached memory), so the
++ * compositor wants the AHardwareBuffer itself: with it, it can read the frame from a GL buffer object that shares the
++ * memory. The buffer is sent over the unix socket named by PMBOS_AHB_SOCKET (SOCK_SEQPACKET), preceded by a header
++ * with the dma-buf's inode, by which the X server finds it again. Without the variable nothing happens.
++ */
++#include <pthread.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++
++#define PMBOS_AHB_MAGIC 0x41424d50u /* "PMBA" */
++
++struct pmbos_ahb_msg {
++   uint32_t magic;
++   uint32_t op; /* 1 = a buffer follows, 2 = the buffer is gone */
++   uint64_t dev;
++   uint64_t ino;
++   uint64_t size;
++};
++
++typedef int (*pfnAHardwareBuffer_sendHandleToUnixSocket)(const AHardwareBuffer *buffer,
++                                                         int socketFd);
++
++static pthread_mutex_t pmbos_ahb_mutex = PTHREAD_MUTEX_INITIALIZER;
++static int pmbos_ahb_fd = -1; /* -1: not tried yet, -2: not available */
++
++/* pmbos_ahb_mutex held */
++static int
++pmbos_ahb_socket(void)
++{
++   if (pmbos_ahb_fd == -1) {
++      const char *path = getenv("PMBOS_AHB_SOCKET");
++      struct sockaddr_un addr = { .sun_family = AF_UNIX };
++
++      pmbos_ahb_fd = -2;
++      if (path && path[0] && strlen(path) < sizeof(addr.sun_path)) {
++         int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
++         if (fd >= 0) {
++            strcpy(addr.sun_path, path);
++            if (!connect(fd, (struct sockaddr *)&addr, sizeof(addr)))
++               pmbos_ahb_fd = fd;
++            else
++               close(fd);
++         }
++         if (pmbos_ahb_fd < 0)
++            vkr_log("PMB OS: no buffer registry at %s (errno %d)", path, errno);
++      }
++   }
++   return pmbos_ahb_fd;
++}
++
++/* pmbos_ahb_mutex held */
++static void
++pmbos_ahb_fail(void)
++{
++   if (pmbos_ahb_fd >= 0)
++      close(pmbos_ahb_fd);
++   pmbos_ahb_fd = -2;
++}
++
++static int vkr_gbm_bo_get_fd(void *gbm_bo);
++
++static void
++pmbos_ahb_announce(struct fake_gbm_bo *bo)
++{
++   pfnAHardwareBuffer_sendHandleToUnixSocket send_handle;
++   struct pmbos_ahb_msg msg = { .magic = PMBOS_AHB_MAGIC, .op = 1, .size = bo->size };
++   struct stat st;
++   int fd, dma_buf;
++
++   pthread_mutex_lock(&pmbos_ahb_mutex);
++   fd = pmbos_ahb_socket();
++   if (fd < 0)
++      goto out;
++
++   send_handle = (pfnAHardwareBuffer_sendHandleToUnixSocket)dlsym(
++      bo->handle, "AHardwareBuffer_sendHandleToUnixSocket");
++   dma_buf = send_handle ? vkr_gbm_bo_get_fd(bo) : -1;
++   if (dma_buf < 0)
++      goto out;
++   if (fstat(dma_buf, &st)) {
++      close(dma_buf);
++      goto out;
++   }
++   close(dma_buf);
++   msg.dev = st.st_dev;
++   msg.ino = st.st_ino;
++
++   if (send(fd, &msg, sizeof(msg), MSG_NOSIGNAL) != (ssize_t)sizeof(msg) ||
++       send_handle(bo->base, fd)) {
++      vkr_log("PMB OS: buffer registry went away (errno %d)", errno);
++      pmbos_ahb_fail();
++      goto out;
++   }
++   bo->announced = true;
++   bo->announced_dev = msg.dev;
++   bo->announced_ino = msg.ino;
++
++out:
++   pthread_mutex_unlock(&pmbos_ahb_mutex);
++}
++
++static void
++pmbos_ahb_withdraw(struct fake_gbm_bo *bo)
++{
++   struct pmbos_ahb_msg msg = {
++      .magic = PMBOS_AHB_MAGIC,
++      .op = 2,
++      .dev = bo->announced_dev,
++      .ino = bo->announced_ino,
++      .size = bo->size,
++   };
++
++   pthread_mutex_lock(&pmbos_ahb_mutex);
++   if (pmbos_ahb_fd >= 0 &&
++       send(pmbos_ahb_fd, &msg, sizeof(msg), MSG_NOSIGNAL) != (ssize_t)sizeof(msg))
++      pmbos_ahb_fail();
++   pthread_mutex_unlock(&pmbos_ahb_mutex);
++   bo->announced = false;
++}
++
+ static void
+ vkr_gbm_bo_destroy(void *gbm_bo)
+ {
+@@ -279,6 +407,8 @@
+    if (!bo)
+       return;
+ 
++   if (bo->announced)
++      pmbos_ahb_withdraw(bo);
+    if (bo->base)
+       bo->release(bo->base);
+    dlclose(bo->handle);
+@@ -322,6 +452,8 @@
+       return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    bo->size = alloc_info->allocationSize;
++   bo->base = NULL;
++   bo->announced = false;
+ 
+    AHardwareBuffer_Desc bo_desc = {
+       .width = alloc_info->allocationSize,
+@@ -536,6 +668,11 @@
+    mem->valid_fd_types = valid_fd_types;
+    mem->udmabuf_fd = udmabuf_fd;
+    mem->gbm_bo = gbm_bo;
++#if defined(__TERMUX__)
++   /* PMB OS: memory the guest driver itself wants to export is what it shares with the window system */
++   if (gbm_bo && might_export)
++      pmbos_ahb_announce(gbm_bo);
++#endif
+    mem->allocation_size = alloc_info->allocationSize;
+    mem->memory_type_index = mem_type_index;
+ }
