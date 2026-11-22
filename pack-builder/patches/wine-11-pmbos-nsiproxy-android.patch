@@ -1,13 +1,24 @@
---- a/dlls/nsiproxy.sys/ndis.c	2026-11-22 01:53:50.078292300 +0100
-+++ b/dlls/nsiproxy.sys/ndis.c	2026-11-22 01:53:50.027978900 +0100
-@@ -307,11 +307,52 @@
+--- a/dlls/nsiproxy.sys/ndis.c	2026-11-22 05:43:40.165216800 +0100
++++ b/dlls/nsiproxy.sys/ndis.c	2026-11-22 05:43:40.346193800 +0100
+@@ -307,11 +307,63 @@
      return entry;
  }
  
-+#ifdef SIOCGIFCONF
++#if defined(SIOCGIFCONF) && defined(SIOCGIFINDEX)
 +/* PMB OS: if_nameindex() lists the interfaces over netlink (RTM_GETLINK), which Android denies to apps (EACCES), so
-+ * it returns NULL there. Enumerate the interfaces that have an IPv4 address with SIOCGIFCONF instead (plain ioctls,
-+ * allowed), and always offer the loopback interface. */
++ * it returns NULL there. Enumerate the interfaces that have an IPv4 address with SIOCGIFCONF instead and take their
++ * indices with SIOCGIFINDEX on the same AF_INET socket (glibc's if_nametoindex() uses an AF_UNIX socket, whose
++ * ioctls Android denies as well), and always offer the loopback interface. */
++static unsigned int if_index_ioctl( int fd, const char *name )
++{
++    struct ifreq req;
++
++    memset( &req, 0, sizeof(req) );
++    memcpy( req.ifr_name, name, min( strlen( name ) + 1, IFNAMSIZ - 1 ) );
++    if (ioctl( fd, SIOCGIFINDEX, &req )) return 0;
++    return req.ifr_ifindex > 0 ? req.ifr_ifindex : 0;
++}
++
 +static unsigned int update_if_table_ioctl( void )
 +{
 +    struct ifreq reqs[64];
@@ -20,21 +31,21 @@
 +    ifc.ifc_len = sizeof(reqs);
 +    ifc.ifc_req = reqs;
 +    count = ioctl( fd, SIOCGIFCONF, &ifc ) ? 0 : ifc.ifc_len / sizeof(struct ifreq);
-+    close( fd );
 +
 +    for (i = 0; i < count; i++)
 +    {
 +        memcpy( name, reqs[i].ifr_name, IFNAMSIZ );
 +        name[IFNAMSIZ - 1] = 0;
 +        if (!strcmp( name, "lo" )) have_lo = 1;
-+        if (!(index = if_nametoindex( name ))) continue;
++        if (!(index = if_index_ioctl( fd, name ))) continue;
 +        if (!find_entry_from_index( index ) && add_entry( index, name )) ++append_count;
 +    }
-+    if (!have_lo && (index = if_nametoindex( "lo" )))
++    if (!have_lo && (index = if_index_ioctl( fd, "lo" )))
 +    {
 +        strcpy( name, "lo" );
 +        if (!find_entry_from_index( index ) && add_entry( index, name )) ++append_count;
 +    }
++    close( fd );
 +    return append_count;
 +}
 +#endif
@@ -44,7 +55,7 @@
      struct if_nameindex *indices = if_nameindex(), *entry;
      unsigned int append_count = 0;
  
-+#ifdef SIOCGIFCONF
++#if defined(SIOCGIFCONF) && defined(SIOCGIFINDEX)
 +    if (!indices) return update_if_table_ioctl();
 +#else
 +    if (!indices) return 0;

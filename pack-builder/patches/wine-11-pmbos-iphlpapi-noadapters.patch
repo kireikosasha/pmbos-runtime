@@ -1,0 +1,16 @@
+--- a/dlls/iphlpapi/iphlpapi_main.c	2026-11-22 05:43:40.210303900 +0100
++++ b/dlls/iphlpapi/iphlpapi_main.c	2026-11-22 05:43:40.346193800 +0100
+@@ -1261,6 +1261,13 @@
+                                   (void **)&rw, sizeof(*rw), (void **)&dyn, sizeof(*dyn),
+                                   (void **)&stat, sizeof(*stat), count, 0 );
+     if (err) return err;
++    if (!*count)
++    {
++        /* PMB OS: no network interfaces at all (an Android app may not see any). Windows answers ERROR_NO_DATA; the
++         * code below would treat a zero-size allocation as an adapter list and walk garbage Next pointers. */
++        NsiFreeTable( luids, rw, dyn, stat );
++        return ERROR_NO_DATA;
++    }
+ 
+     needed = *count * (sizeof(*aa) + ((CHARS_IN_GUID + 1) & ~1) + sizeof(stat->descr.String));
+     needed += *count * sizeof(rw->alias.String); /* GAA_FLAG_SKIP_FRIENDLY_NAME is ignored */
