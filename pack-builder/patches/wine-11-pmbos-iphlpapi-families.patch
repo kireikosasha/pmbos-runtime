@@ -1,0 +1,32 @@
+PMB OS: an address family that cannot be enumerated no longer makes GetAdaptersAddresses fail.
+
+Android denies apps the IPv6 address tables; the IPv6 pass returned ERROR_NO_MORE_ITEMS and GetAdaptersAddresses
+failed as a whole, so programs saw no network adapter at all. That family now just has no addresses, as on Windows.
+
+--- a/dlls/iphlpapi/iphlpapi_main.c
++++ b/dlls/iphlpapi/iphlpapi_main.c
+@@ -1153,12 +1153,24 @@
+     if (family != AF_INET)
+     {
+         err = fn( aa, AF_INET6, flags );
++        /* PMB OS: a family the system does not let us enumerate (Android denies the IPv6 tables to apps) has no
++         * addresses; on Windows it never makes the whole adapter list fail. */
++        if (err && err != ERROR_NOT_ENOUGH_MEMORY && err != ERROR_OUTOFMEMORY)
++        {
++            WARN( "IPv6 enumeration failed (%lu), no IPv6 addresses\n", err );
++            err = ERROR_SUCCESS;
++        }
+         if (err) return err;
+     }
+ 
+     if (family != AF_INET6)
+     {
+         err = fn( aa, AF_INET, flags );
++        if (err && err != ERROR_NOT_ENOUGH_MEMORY && err != ERROR_OUTOFMEMORY)
++        {
++            WARN( "IPv4 enumeration failed (%lu), no IPv4 addresses\n", err );
++            err = ERROR_SUCCESS;
++        }
+         if (err) return err;
+     }
+     return err;
