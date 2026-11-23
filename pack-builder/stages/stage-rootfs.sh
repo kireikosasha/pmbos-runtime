@@ -100,6 +100,15 @@ rm -rf usr/lib/apt usr/lib/dpkg usr/lib/mime usr/lib/ssl usr/lib/systemd usr/lib
 # optional plugins of libraries the codecs pull in, for outputs PMB OS doesn't have (libcaca's OpenGL / X11 drivers
 # would need libGL, libglut...): never loaded by gstreamer
 rm -rf "usr/lib/$TRIPLET/caca"
+# update-alternatives links (maintainer scripts never ran in --variant=extract): BLAS / LAPACK live in
+# usr/lib/<triplet>/{blas,lapack}/ and are found as usr/lib/<triplet>/lib{blas,lapack}.so.3 (libav's codecs need them)
+for alt in blas lapack; do
+    f="usr/lib/$TRIPLET/$alt/lib$alt.so.3"
+    if [ -e "$f" ] && [ ! -e "usr/lib/$TRIPLET/lib$alt.so.3" ]; then
+        ln -s "$alt/lib$alt.so.3" "usr/lib/$TRIPLET/lib$alt.so.3"
+        log "alternatives: lib$alt.so.3 -> $alt/lib$alt.so.3"
+    fi
+done
 find usr/lib -name '*.a' -delete
 find usr/lib -name '*.la' -delete
 # CA bundle (ca-certificates' postinst never ran): sorted, deterministic
