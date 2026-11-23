@@ -97,6 +97,9 @@ rm -rf usr/lib/apt usr/lib/dpkg usr/lib/mime usr/lib/ssl usr/lib/systemd usr/lib
        usr/lib/tmpfiles.d usr/lib/sysusers.d usr/lib/os-release usr/lib/ucf usr/lib/sasl2 \
        usr/lib/aarch64-linux-gnu/perl usr/lib/aarch64-linux-gnu/perl-base usr/lib/aarch64-linux-gnu/perl5 \
        usr/lib/aarch64-linux-gnu/audit
+# optional plugins of libraries the codecs pull in, for outputs PMB OS doesn't have (libcaca's OpenGL / X11 drivers
+# would need libGL, libglut...): never loaded by gstreamer
+rm -rf "usr/lib/$TRIPLET/caca"
 find usr/lib -name '*.a' -delete
 find usr/lib -name '*.la' -delete
 # CA bundle (ca-certificates' postinst never ran): sorted, deterministic
