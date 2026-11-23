@@ -1,0 +1,54 @@
+PMB OS: DirectSound mixes at the rate a DSSCL_PRIORITY application set for the primary buffer.
+
+As on Windows XP, IDirectSoundBuffer::SetFormat on the primary buffer at DSSCL_PRIORITY sets the output rate
+(32..192 kHz; lower rates keep the device rate). Wine always mixed at the device mix format (48 kHz) and resampled
+every secondary buffer with its FIR resampler - for an RPG Maker VX Ace game's single 44.1 kHz stream that was
+about a fifth of the game's CPU time under box64. The stream is now opened at the app's rate (AUTOCONVERTPCM) and
+converted natively by the audio stack.
+--- a/dlls/dsound/dsound_private.h
++++ b/dlls/dsound/dsound_private.h
+@@ -84,6 +84,7 @@
+     CRITICAL_SECTION            mixlock;
+     IDirectSoundBufferImpl     *primary;
+     DWORD                       speaker_config;
++    DWORD                       app_rate; /* PMB OS: mixing rate requested by the app's primary SetFormat, 0 = mix format */
+     float                       speaker_angles[DS_MAX_CHANNELS];
+     int                         speaker_num[DS_MAX_CHANNELS];
+     int                         num_speakers;
+--- a/dlls/dsound/primary.c
++++ b/dlls/dsound/primary.c
+@@ -135,6 +135,10 @@
+             wfe.dwChannelMask = speaker_config_to_channel_mask(device->speaker_config);
+         }
+ 
++        /* PMB OS: mix at the rate the application chose for the primary buffer (see primarybuffer_SetFormat) */
++        if (device->app_rate)
++            wfe.Format.nSamplesPerSec = device->app_rate;
++
+         wfe.Format.nBlockAlign = wfe.Format.nChannels * wfe.Format.wBitsPerSample / 8;
+         wfe.Format.nAvgBytesPerSec = wfe.Format.nSamplesPerSec * wfe.Format.nBlockAlign;
+ 
+@@ -481,6 +485,23 @@
+ 			device->primary_pwfx = wfx;
+ 		} else
+ 			err = DSERR_OUTOFMEMORY;
++
++		/* PMB OS: as on Windows XP, the primary format of a DSSCL_PRIORITY application sets the output rate.
++		 * Mixing at the device rate instead resamples every secondary buffer of that (usually identical) rate
++		 * with the FIR resampler, which is expensive under emulation (about a fifth of the CPU time of a game
++		 * playing one 44.1 kHz stream); the audio stack converts the stream natively (AUTOCONVERTPCM). Rates below
++		 * 32 kHz keep the device rate, so a legacy 22 kHz primary format does not lower the output quality. */
++		if (err == S_OK && passed_fmt->nSamplesPerSec >= 32000 && passed_fmt->nSamplesPerSec <= 192000 &&
++		    device->pwfx && passed_fmt->nSamplesPerSec != device->pwfx->nSamplesPerSec) {
++			DWORD old_rate = device->app_rate;
++			device->app_rate = passed_fmt->nSamplesPerSec;
++			if (FAILED(DSOUND_ReopenDevice(device, FALSE))) {
++				WARN("output at %lu Hz failed, keeping the mix format\n", device->app_rate);
++				device->app_rate = old_rate;
++				DSOUND_ReopenDevice(device, FALSE);
++			} else
++				TRACE("mixing at %lu Hz\n", device->app_rate);
++		}
+ 	}
+ 
+ out:
