@@ -64,6 +64,8 @@ run_clean env PMBOS_ROOTFS="$fs" "$fs/lib/ld-linux-aarch64.so.1" --library-path 
     "$BUILD/glibc/glibc-rootfs-test" --imagefs \
     || die "shipped imagefs /etc files or /bin/sh do not work through PMBOS_ROOTFS"
 
+[ -s "$fs/usr/lib/locale/C.utf8/LC_CTYPE" ] || die "imagefs has no UTF-8 locale (usr/lib/locale/C.utf8)"
+
 log "LOADER mode: stock ld.so (= APK libpmbld.so) + imagefs glibc"
 grep -q PMBOS_LOADER_LIBPATH "$fs/usr/lib/aarch64-linux-gnu/libc.so.6" || die "imagefs libc.so.6 lacks the execve redirect"
 loader_env=(PMBOS_LOADER="$stock" PMBOS_LOADER_LIBPATH="$libpath" PMBOS_ROOTFS="$fs")

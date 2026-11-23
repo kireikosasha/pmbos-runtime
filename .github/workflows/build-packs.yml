@@ -45,7 +45,7 @@ on:
         required: false
         default: ""
       rebuild:
-        description: "Stages built anew even when reuse_run is set (space separated; supported: wine mesa)"
+        description: "Stages built anew even when reuse_run is set (space separated; supported: wine mesa imagefs)"
         type: string
         required: false
         default: ""
@@ -167,7 +167,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Reuse stage artifacts from an earlier run
         id: reuse
-        if: inputs.reuse_run != ''
+        if: inputs.reuse_run != '' && !contains(format(' {0} ', inputs.rebuild), ' imagefs ')
         env:
           GH_TOKEN: ${{ github.token }}
           REUSE_RUN: ${{ inputs.reuse_run }}

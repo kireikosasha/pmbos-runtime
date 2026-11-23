@@ -26,8 +26,11 @@ LD=ld-linux-aarch64.so.1
 rm -rf "$raw" "$root" "$STAGE/imagefs.pack.json"
 mkdir -p "$STAGE"
 
+# libc-bin: only for /usr/lib/locale/C.utf8 - glibc's UTF-8 locale is NOT built into libc.so.6, and without it every
+# process stays in the 7-bit "C" locale whatever LANG says (Wine then converts file names as US-ASCII: nothing with a
+# non-ASCII name can be opened). The launcher points LOCPATH at <imagefs>/usr/lib/locale. Its programs are trimmed below.
 # shellcheck disable=SC2086
-pkgs="$(echo $ROOTFS_PACKAGES $ROOTFS_OPTIONAL_PACKAGES | tr ' ' ',')"
+pkgs="$(echo $ROOTFS_PACKAGES $ROOTFS_OPTIONAL_PACKAGES libc-bin | tr ' ' ',')"
 log "mmdebstrap $DEBIAN_SUITE arm64: $pkgs"
 mmdebstrap --mode=root --variant=extract --architectures=arm64 \
     --skip=check/qemu,chroot/mount \
@@ -76,6 +79,9 @@ rm -rf "usr/lib/$TRIPLET/gconv"
 cp -a --remove-destination "$gl/usr/lib/$TRIPLET/." "usr/lib/$TRIPLET/"
 grep -q PMBOS_ROOTFS "usr/lib/$TRIPLET/libc.so.6" || die "imagefs libc.so.6 is not the PMBOS_ROOTFS build"
 grep -q PMBOS_LOADER_LIBPATH "usr/lib/$TRIPLET/libc.so.6" || die "imagefs libc.so.6 lacks the PMBOS_LOADER execve redirect"
+# the UTF-8 locale (libc-bin of the same glibc release: the locale file format belongs to the release)
+[ -s usr/lib/locale/C.utf8/LC_CTYPE ] || die "usr/lib/locale/C.utf8 missing (libc-bin not extracted?)"
+find usr/lib/locale -mindepth 1 -maxdepth 1 ! -name C.utf8 -exec rm -rf {} +
 cmp -s "$gl/lib/$LD" "lib/$LD" || die "imagefs loader is not the rebuilt one"
 
 # --- trimming (nothing from the imagefs is executed except the loader and /bin/sh) ---------
