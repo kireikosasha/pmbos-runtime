@@ -1,0 +1,66 @@
+PMB OS: DirectDraw blits to the screen from windows that are partly off-screen.
+
+A window clipper's clip list is the window's visible region, which Wine does not clip to the screen. On Windows it
+never extends past the desktop. A game whose window is wider than the screen (RPG Maker VX Ace centers its 640x480
+window and ends up at a negative x on a narrow portrait phone screen) blitted every frame to a destination box that
+starts left of the primary surface; wined3d rejected the whole blit and the game showed only black. Each clip
+rectangle is now intersected with the destination surface first, so the visible part is drawn.
+
+--- a/dlls/ddraw/surface.c
++++ b/dlls/ddraw/surface.c
+@@ -1614,7 +1614,7 @@
+         struct ddraw_surface *src_surface, const RECT *src_rect_in, DWORD flags, DWORD fill_colour,
+         const struct wined3d_blt_fx *fx, enum wined3d_texture_filter_type filter)
+ {
+-    RECT src_rect, dst_rect;
++    RECT src_rect, dst_rect, surface_rect;
+     float scale_x, scale_y;
+     const RECT *clip_rect;
+     DWORD clip_list_size;
+@@ -1689,17 +1689,26 @@
+         return hr;
+     }
+ 
++    /* PMB OS: a window clipper's clip list is the window's visible region, which Wine does not clip to the screen.
++     * On Windows it never extends past the desktop; a window partly off-screen (a game centering a window wider
++     * than the screen) would otherwise make every blit to the primary surface fail with an invalid box, and the
++     * game shows nothing at all. Only the part that is on the destination surface is drawn. */
++    SetRect(&surface_rect, 0, 0, dst_surface->surface_desc.dwWidth, dst_surface->surface_desc.dwHeight);
+     clip_rect = (RECT *)clip_list->Buffer;
+     for (i = 0; i < clip_list->rdh.nCount; ++i)
+     {
+         RECT src_rect_clipped = src_rect;
++        RECT clipped;
++
++        if (!IntersectRect(&clipped, &clip_rect[i], &surface_rect))
++            continue;
+ 
+         if (src_surface)
+         {
+-            src_rect_clipped.left += (LONG)((clip_rect[i].left - dst_rect.left) * scale_x);
+-            src_rect_clipped.top += (LONG)((clip_rect[i].top - dst_rect.top) * scale_y);
+-            src_rect_clipped.right -= (LONG)((dst_rect.right - clip_rect[i].right) * scale_x);
+-            src_rect_clipped.bottom -= (LONG)((dst_rect.bottom - clip_rect[i].bottom) * scale_y);
++            src_rect_clipped.left += (LONG)((clipped.left - dst_rect.left) * scale_x);
++            src_rect_clipped.top += (LONG)((clipped.top - dst_rect.top) * scale_y);
++            src_rect_clipped.right -= (LONG)((dst_rect.right - clipped.right) * scale_x);
++            src_rect_clipped.bottom -= (LONG)((dst_rect.bottom - clipped.bottom) * scale_y);
+ 
+             if (src_surface->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE)
+             {
+@@ -1708,13 +1717,13 @@
+             }
+         }
+ 
+-        if (FAILED(hr = ddraw_surface_blt(dst_surface, &clip_rect[i],
++        if (FAILED(hr = ddraw_surface_blt(dst_surface, &clipped,
+                 src_surface, &src_rect_clipped, flags, fill_colour, fx, filter)))
+             break;
+ 
+         if (dst_surface->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE)
+         {
+-            if (FAILED(hr = ddraw_surface_update_frontbuffer(dst_surface, &clip_rect[i], FALSE, 0)))
++            if (FAILED(hr = ddraw_surface_update_frontbuffer(dst_surface, &clipped, FALSE, 0)))
+                 break;
+         }
+     }
