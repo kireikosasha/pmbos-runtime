@@ -104,7 +104,7 @@ mkdir -p etc/ssl/certs
 find usr/share/ca-certificates -name '*.crt' -print0 | LC_ALL=C sort -z | xargs -0 cat > etc/ssl/certs/ca-certificates.crt
 [ -s etc/ssl/certs/ca-certificates.crt ] || die "empty CA bundle"
 # keep only the share/ data that native libraries read at runtime
-keep_share="fonts fontconfig X11 alsa doc zoneinfo"
+keep_share="fonts fontconfig X11 alsa doc zoneinfo sounds"
 for d in usr/share/*; do
     case " $keep_share " in *" $(basename "$d") "*) ;; *) rm -rf "$d" ;; esac
 done

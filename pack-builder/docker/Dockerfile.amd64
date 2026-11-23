@@ -16,4 +16,5 @@ RUN apt-get update \
       libxcursor-dev libxcomposite-dev libxinerama-dev libxxf86vm-dev \
       libfreetype-dev libfontconfig-dev libvulkan-dev libgnutls28-dev \
       libasound2-dev libpulse-dev libegl-dev libgl-dev \
+      libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
  && rm -rf /var/lib/apt/lists/*

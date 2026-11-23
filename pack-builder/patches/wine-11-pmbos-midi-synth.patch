@@ -1,0 +1,301 @@
+PMB OS: a software MIDI synthesizer in winealsa.drv for systems without an ALSA sequencer.
+
+Android has no ALSA sequencer, so Wine offered no MIDI out device at all: MIDI music (RPG Maker 2000/2003/XP,
+many older games) stayed silent or the program failed. When PMBOS_SOUNDFONT names a SoundFont 2 file, a device
+"PMB OS Synth" is offered instead; while open it renders with TinySoundFont (tsf.h, MIT, copied into
+dlls/winealsa.drv by the pack builder) to the ALSA PCM "default" (PMB OS: the app's sound server). GM / GS / XG
+reset SysEx restore the defaults; channel 10 plays drums.
+
+diff -ru a/dlls/winealsa.drv/Makefile.in b/dlls/winealsa.drv/Makefile.in
+--- a/dlls/winealsa.drv/Makefile.in
++++ b/dlls/winealsa.drv/Makefile.in
+@@ -3,7 +3,7 @@
+ IMPORTS   = uuid ole32 advapi32
+ DELAYIMPORTS = winmm
+ UNIX_CFLAGS  = $(ALSA_CFLAGS)
+-UNIX_LIBS    = $(ALSA_LIBS) $(PTHREAD_LIBS)
++UNIX_LIBS    = $(ALSA_LIBS) $(PTHREAD_LIBS) -lm
+ 
+ SOURCES = \
+ 	alsa.c \
+diff -ru a/dlls/winealsa.drv/alsamidi.c b/dlls/winealsa.drv/alsamidi.c
+--- a/dlls/winealsa.drv/alsamidi.c
++++ b/dlls/winealsa.drv/alsamidi.c
+@@ -61,6 +61,7 @@
+     snd_seq_t          *seq;
+     snd_seq_addr_t      addr;
+     int                 port_out;
++    BOOL                synth; /* PMB OS: the software synthesizer */
+ };
+ 
+ struct midi_src
+@@ -118,6 +119,179 @@
+     pthread_mutex_unlock(&in_buffer_mutex);
+ }
+ 
++
++/* PMB OS: a software synthesizer for systems without an ALSA sequencer (Android has none, so no MIDI device
++ * existed and MIDI music - RPG Maker, older games - stayed silent or failed). When PMBOS_SOUNDFONT names a SoundFont
++ * 2 file, a MIDI out device "PMB OS Synth" is offered; it renders with TinySoundFont (MIT, tsf.h) to the ALSA PCM
++ * "default" while it is open. */
++#define TSF_IMPLEMENTATION
++#define TSF_STATIC
++#include <math.h>
++#include "tsf.h"
++
++#define SYNTH_RATE 44100
++#define SYNTH_CHUNK 441 /* 10 ms */
++
++static pthread_mutex_t synth_mutex = PTHREAD_MUTEX_INITIALIZER;
++static tsf *synth;
++static snd_pcm_t *synth_pcm;
++static pthread_t synth_thread;
++static volatile int synth_running;
++
++static const char *synth_soundfont(void)
++{
++    const char *p = getenv("PMBOS_SOUNDFONT");
++    return p && *p && !access(p, R_OK) ? p : NULL;
++}
++
++/* all channels to their GM defaults; channel 10 plays drums */
++static void synth_defaults(void)
++{
++    int ch;
++    tsf_reset(synth);
++    for (ch = 0; ch < 16; ch++)
++    {
++        tsf_channel_set_presetnumber(synth, ch, 0, ch == 9);
++        tsf_channel_set_volume(synth, ch, 100.0f / 127.0f);
++        tsf_channel_set_pitchrange(synth, ch, 2.0f);
++    }
++}
++
++static void *synth_render(void *arg)
++{
++    short buf[SYNTH_CHUNK * 2];
++    while (synth_running)
++    {
++        snd_pcm_sframes_t n;
++        pthread_mutex_lock(&synth_mutex);
++        tsf_render_short(synth, buf, SYNTH_CHUNK, 0);
++        pthread_mutex_unlock(&synth_mutex);
++        n = snd_pcm_writei(synth_pcm, buf, SYNTH_CHUNK);
++        if (n < 0) n = snd_pcm_recover(synth_pcm, n, 1);
++        if (n < 0)
++        {
++            WARN("synth output: %s\n", snd_strerror(n));
++            break;
++        }
++    }
++    return NULL;
++}
++
++static UINT synth_start(void)
++{
++    const char *sf = synth_soundfont();
++    int err;
++    if (!sf) return MIDIERR_NODEVICE;
++    pthread_mutex_lock(&synth_mutex);
++    if (!synth)
++    {
++        if (!(synth = tsf_load_filename(sf)))
++        {
++            pthread_mutex_unlock(&synth_mutex);
++            ERR("cannot load the SoundFont %s\n", sf);
++            return MIDIERR_NODEVICE;
++        }
++        tsf_set_output(synth, TSF_STEREO_INTERLEAVED, SYNTH_RATE, 0.0f);
++        tsf_set_max_voices(synth, 96);
++    }
++    synth_defaults();
++    pthread_mutex_unlock(&synth_mutex);
++    if ((err = snd_pcm_open(&synth_pcm, "default", SND_PCM_STREAM_PLAYBACK, 0)) < 0)
++    {
++        ERR("cannot open the PCM for the synth: %s\n", snd_strerror(err));
++        return MMSYSERR_ALLOCATED;
++    }
++    if ((err = snd_pcm_set_params(synth_pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2,
++                                  SYNTH_RATE, 1, 60000)) < 0)
++    {
++        ERR("synth PCM parameters: %s\n", snd_strerror(err));
++        snd_pcm_close(synth_pcm);
++        synth_pcm = NULL;
++        return MMSYSERR_ALLOCATED;
++    }
++    synth_running = 1;
++    if (pthread_create(&synth_thread, NULL, synth_render, NULL))
++    {
++        synth_running = 0;
++        snd_pcm_close(synth_pcm);
++        synth_pcm = NULL;
++        return MMSYSERR_NOMEM;
++    }
++    return MMSYSERR_NOERROR;
++}
++
++static void synth_stop(void)
++{
++    if (!synth_running) return;
++    synth_running = 0;
++    pthread_join(synth_thread, NULL);
++    snd_pcm_drop(synth_pcm);
++    snd_pcm_close(synth_pcm);
++    synth_pcm = NULL;
++    pthread_mutex_lock(&synth_mutex);
++    tsf_note_off_all(synth);
++    pthread_mutex_unlock(&synth_mutex);
++}
++
++static void synth_event(BYTE evt, BYTE d1, BYTE d2)
++{
++    int ch = evt & 0x0f;
++    pthread_mutex_lock(&synth_mutex);
++    if (synth)
++    {
++        switch (evt & 0xf0)
++        {
++        case 0x80: tsf_channel_note_off(synth, ch, d1); break;
++        case 0x90:
++            if (d2) tsf_channel_note_on(synth, ch, d1, d2 / 127.0f);
++            else tsf_channel_note_off(synth, ch, d1);
++            break;
++        case 0xb0: tsf_channel_midi_control(synth, ch, d1, d2); break;
++        case 0xc0: tsf_channel_set_presetnumber(synth, ch, d1, ch == 9); break;
++        case 0xe0: tsf_channel_set_pitchwheel(synth, ch, (d2 << 7) | d1); break;
++        default: break; /* aftertouch, system messages */
++        }
++    }
++    pthread_mutex_unlock(&synth_mutex);
++}
++
++/* GM / GS / XG reset SysEx: back to defaults */
++static void synth_sysex(const BYTE *data, UINT len)
++{
++    static const BYTE gm_on[] = {0xf0, 0x7e, 0x7f, 0x09, 0x01, 0xf7};
++    BOOL reset = len >= sizeof(gm_on) && !memcmp(data, gm_on, sizeof(gm_on));
++    if (len >= 11 && data[0] == 0xf0 && data[1] == 0x41 && data[4] == 0x12 && data[5] == 0x40 && data[6] == 0x00 &&
++        data[7] == 0x7f) reset = TRUE; /* GS reset */
++    if (len >= 9 && data[0] == 0xf0 && data[1] == 0x43 && data[3] == 0x4c && data[6] == 0x7e) reset = TRUE; /* XG */
++    if (!reset) return;
++    pthread_mutex_lock(&synth_mutex);
++    if (synth) synth_defaults();
++    pthread_mutex_unlock(&synth_mutex);
++}
++
++static void synth_add_dest(void)
++{
++    static const WCHAR name[] = {'P','M','B',' ','O','S',' ','S','y','n','t','h',0};
++    struct midi_dest *dest;
++
++    dests = realloc(dests, (num_dests + 1) * sizeof(*dests));
++    dest = dests + num_dests;
++    memset(dest, 0, sizeof(*dest));
++    dest->synth = TRUE;
++    dest->caps.wMid = 0x00FF;
++    dest->caps.wPid = 0x0002;
++    dest->caps.vDriverVersion = 0x001;
++    dest->caps.wTechnology = MOD_SWSYNTH;
++    dest->caps.wVoices = 32;
++    dest->caps.wNotes = 96;
++    dest->caps.wChannelMask = 0xFFFF;
++    dest->caps.dwSupport = 0;
++    memcpy(dest->caps.szPname, name, sizeof(name));
++    dest->bEnabled = TRUE;
++    dest->port_out = -1;
++    num_dests++;
++}
++
+ static uint64_t get_time_msec(void)
+ {
+     struct timespec now = {0, 0};
+@@ -429,7 +603,13 @@
+ 
+     /* try to open device */
+     if (!(seq = seq_open(NULL)))
+-        return ERROR_OPEN_FAILED;
++    {
++        /* PMB OS: no sequencer (Android): the software synthesizer is the MIDI device */
++        if (!synth_soundfont()) return ERROR_OPEN_FAILED;
++        synth_add_dest();
++        TRACE("no ALSA sequencer, MIDI out = PMB OS Synth\n");
++        return NOERROR;
++    }
+ 
+     cinfo = calloc( 1, snd_seq_client_info_sizeof() );
+     pinfo = calloc( 1, snd_seq_port_info_sizeof() );
+@@ -523,6 +703,17 @@
+         return MMSYSERR_INVALFLAG;
+     }
+ 
++    if (dest->synth)
++    {
++        UINT err = synth_start();
++        if (err) return err;
++        dest->runningStatus = 0;
++        dest->wFlags = HIWORD(flags & CALLBACK_TYPEMASK);
++        dest->midiDesc = *midi_desc;
++        set_out_notify(notify, dest, dev_id, MOM_OPEN, 0, 0);
++        return MMSYSERR_NOERROR;
++    }
++
+     switch (dest->caps.wTechnology)
+     {
+     case MOD_FMSYNTH:
+@@ -604,6 +795,14 @@
+     /* FIXME: should test that no pending buffer is still in the queue for
+      * playing */
+ 
++    if (dest->synth)
++    {
++        synth_stop();
++        set_out_notify(notify, dest, dev_id, MOM_CLOSE, 0, 0);
++        dest->midiDesc.hMidi = 0;
++        return MMSYSERR_NOERROR;
++    }
++
+     if (dest->seq == NULL)
+     {
+         WARN("can't close !\n");
+@@ -647,7 +846,7 @@
+ 
+     if (!dest->bEnabled) return MIDIERR_NODEVICE;
+ 
+-    if (dest->seq == NULL)
++    if (dest->seq == NULL && !dest->synth)
+     {
+         WARN("can't play !\n");
+         return MIDIERR_NODEVICE;
+@@ -674,6 +873,12 @@
+         return MMSYSERR_NOERROR;
+     }
+ 
++    if (dest->synth)
++    {
++        synth_event(evt, d1, d2);
++        return MMSYSERR_NOERROR;
++    }
++
+     switch (dest->caps.wTechnology)
+     {
+     case MOD_SYNTH:
+@@ -801,7 +1006,7 @@
+ 
+     if (!dest->bEnabled) return MIDIERR_NODEVICE;
+ 
+-    if (dest->seq == NULL)
++    if (dest->seq == NULL && !dest->synth)
+     {
+         WARN("can't play !\n");
+         return MIDIERR_NODEVICE;
+@@ -836,6 +1041,10 @@
+ 
+     switch (dest->caps.wTechnology)
+     {
++    case MOD_SWSYNTH:
++        if (dest->synth) synth_sysex(data, hdr->dwBufferLength);
++        free(new_data);
++        break;
+     case MOD_FMSYNTH:
+         /* FIXME: I don't think there is much to do here */
+         free(new_data);

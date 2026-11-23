@@ -1,0 +1,346 @@
+PMB OS: gamepads of the Android app in winebus (in the SDL slot, which is empty without SDL).
+
+An Android app cannot open input device nodes, so Wine saw no joystick at all: games found no XInput / DirectInput
+controller, and a physical gamepad worked only as keys. When PMBOS_GAMEPAD_SOCKET is set, the SDL bus slot (Wine is
+built without SDL) connects to the PMB OS app instead and turns every gamepad the app reports into an Xbox 360
+controller (HID gamepad + haptics, XInput compatible). Rumble requests go back to the app.
+
+diff -ru a/dlls/winebus.sys/bus_sdl.c b/dlls/winebus.sys/bus_sdl.c
+diff -ru a2/dlls/winebus.sys/bus_sdl.c b/dlls/winebus.sys/bus_sdl.c
+--- a/dlls/winebus.sys/bus_sdl.c
++++ b/dlls/winebus.sys/bus_sdl.c
+@@ -1228,22 +1228,328 @@
+ 
+ #else
+ 
++/* PMB OS: without SDL (Android: no device nodes an app could open) the SDL slot of winebus serves the gamepads the
++ * PMB OS app sees. The app listens on the unix socket named by PMBOS_GAMEPAD_SOCKET ("@name" = abstract namespace)
++ * and streams fixed 32-byte little-endian records:
++ *     u32 type (1 connected, 2 disconnected, 3 state), u32 id, u32 buttons, s16 axes[6], 8 bytes reserved
++ * buttons: bit 0 A, 1 B, 2 X, 3 Y, 4 LB, 5 RB, 6 Back, 7 Start, 8 LS, 9 RS, 10 up, 11 down, 12 left, 13 right,
++ * 14 Guide; axes: left x, left y, right x, right y (-32768..32767, y down positive), left / right trigger
++ * (0..32767). Each pad becomes an Xbox 360 controller (XInput, DirectInput, WinMM joystick). Rumble requests go
++ * back as type 4 records: u32 4, u32 id, u32 duration ms, u16 low frequency, u16 high frequency.
++ */
++#include <poll.h>
++#include <stddef.h>
++#include <string.h>
++#include <time.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++
++#define PMB_PAD_MAX 8
++
++struct pmb_pad_record
++{
++    UINT32 type;
++    UINT32 id;
++    UINT32 buttons;
++    INT16 axes[6];
++    BYTE reserved[8];
++};
++
++struct pmb_pad
++{
++    struct unix_device unix_device;
++    UINT32 id;
++    UINT32 buttons;
++    BOOL removed;
++};
++
++static pthread_mutex_t pad_cs = PTHREAD_MUTEX_INITIALIZER;
++static struct list event_queue = LIST_INIT(event_queue);
++static struct pmb_pad *pads[PMB_PAD_MAX];
++static int pad_fd = -1;
++static int pad_wake[2] = {-1, -1};
++static volatile int pad_quit;
++static char pad_socket[108];
++static ULONGLONG pad_next_connect;
++static BYTE pad_rx[sizeof(struct pmb_pad_record)];
++static size_t pad_rx_len;
++
++static inline struct pmb_pad *pad_from_unix_device(struct unix_device *iface)
++{
++    return CONTAINING_RECORD(iface, struct pmb_pad, unix_device);
++}
++
++static void pad_device_destroy(struct unix_device *iface)
++{
++}
++
++static NTSTATUS pad_device_start(struct unix_device *iface)
++{
++    return STATUS_SUCCESS;
++}
++
++static void pad_device_stop(struct unix_device *iface)
++{
++    struct pmb_pad *pad = pad_from_unix_device(iface);
++    int i;
++    pthread_mutex_lock(&pad_cs);
++    for (i = 0; i < PMB_PAD_MAX; i++) if (pads[i] == pad) pads[i] = NULL;
++    pthread_mutex_unlock(&pad_cs);
++}
++
++static void pad_send_rumble(UINT32 id, UINT32 ms, USHORT low, USHORT high)
++{
++    UINT32 msg[4] = {4, id, ms, (UINT32)low | ((UINT32)high << 16)};
++    pthread_mutex_lock(&pad_cs);
++    if (pad_fd >= 0) send(pad_fd, msg, sizeof(msg), MSG_NOSIGNAL | MSG_DONTWAIT);
++    pthread_mutex_unlock(&pad_cs);
++}
++
++static NTSTATUS pad_device_haptics_start(struct unix_device *iface, UINT duration_ms, USHORT rumble_intensity,
++                                         USHORT buzz_intensity, USHORT left_intensity, USHORT right_intensity)
++{
++    struct pmb_pad *pad = pad_from_unix_device(iface);
++    pad_send_rumble(pad->id, duration_ms, rumble_intensity, buzz_intensity);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS pad_device_haptics_stop(struct unix_device *iface)
++{
++    struct pmb_pad *pad = pad_from_unix_device(iface);
++    pad_send_rumble(pad->id, 0, 0, 0);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS pad_device_physical_device_control(struct unix_device *iface, USAGE control)
++{
++    return STATUS_NOT_SUPPORTED;
++}
++
++static NTSTATUS pad_device_physical_device_set_gain(struct unix_device *iface, BYTE percent)
++{
++    return STATUS_NOT_SUPPORTED;
++}
++
++static NTSTATUS pad_device_physical_effect_control(struct unix_device *iface, BYTE index, USAGE control, BYTE iterations)
++{
++    return STATUS_NOT_SUPPORTED;
++}
++
++static NTSTATUS pad_device_physical_effect_update(struct unix_device *iface, BYTE index, struct effect_params *params)
++{
++    return STATUS_NOT_SUPPORTED;
++}
++
++static const struct hid_device_vtbl pad_device_vtbl =
++{
++    pad_device_destroy,
++    pad_device_start,
++    pad_device_stop,
++    pad_device_haptics_start,
++    pad_device_haptics_stop,
++    pad_device_physical_device_control,
++    pad_device_physical_device_set_gain,
++    pad_device_physical_effect_control,
++    pad_device_physical_effect_update,
++};
++
++static void pad_connected(UINT32 id)
++{
++    static const USAGE_AND_PAGE device_usage = {.UsagePage = HID_USAGE_PAGE_GENERIC, .Usage = HID_USAGE_GENERIC_GAMEPAD};
++    struct device_desc desc =
++    {
++        .vid = 0x045e,
++        .pid = 0x028e, /* Xbox 360 controller: what games expect */
++        .version = 0x0114,
++        .input = -1,
++        .uid = id,
++        .is_gamepad = TRUE,
++        .manufacturer = {'P','M','B',' ','O','S',0},
++        .product = {'C','o','n','t','r','o','l','l','e','r',' ','(','X','B','O','X',' ','3','6','0',' ','F','o','r',' ','W','i','n','d','o','w','s',')',0},
++        .serialnumber = {'0','0','0','0',0},
++    };
++    struct pmb_pad *pad;
++    int i;
++
++    if (id >= PMB_PAD_MAX || pads[id]) return;
++    desc.serialnumber[3] = '0' + id;
++    if (!(pad = hid_device_create(&pad_device_vtbl, sizeof(struct pmb_pad)))) return;
++    pad->id = id;
++    if (!hid_device_begin_report_descriptor(&pad->unix_device, &device_usage) ||
++        !hid_device_add_gamepad(&pad->unix_device) ||
++        !hid_device_add_haptics(&pad->unix_device) ||
++        !hid_device_end_report_descriptor(&pad->unix_device))
++    {
++        ERR("cannot build the report descriptor of pad %u\n", id);
++        pad->unix_device.vtbl->destroy(&pad->unix_device);
++        return;
++    }
++    for (i = 0; i < 6; i++) hid_device_set_abs_axis(&pad->unix_device, i, i == 1 || i == 3 ? -1 : 0);
++    pthread_mutex_lock(&pad_cs);
++    pads[id] = pad;
++    pthread_mutex_unlock(&pad_cs);
++    TRACE("pad %u connected\n", id);
++    bus_event_queue_device_created(&event_queue, &pad->unix_device, &desc);
++}
++
++static void pad_disconnected(UINT32 id)
++{
++    struct pmb_pad *pad;
++    if (id >= PMB_PAD_MAX || !(pad = pads[id]) || pad->removed) return;
++    pad->removed = TRUE;
++    TRACE("pad %u disconnected\n", id);
++    bus_event_queue_device_removed(&event_queue, &pad->unix_device);
++}
++
++static void pad_state(const struct pmb_pad_record *r)
++{
++    struct pmb_pad *pad;
++    struct unix_device *iface;
++    struct hid_device_state *state;
++    static const int button_index[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
++    int i;
++
++    if (r->id >= PMB_PAD_MAX || !(pad = pads[r->id]) || pad->removed) return;
++    iface = &pad->unix_device;
++    state = &iface->hid_device_state;
++    for (i = 0; i < 10; i++) hid_device_set_button(iface, button_index[i], (r->buttons >> i) & 1);
++    hid_device_set_button(iface, 16, (r->buttons >> 14) & 1);
++    /* d-pad also as buttons, like the SDL backend: 10 up, 11 right, 12 down, 13 left */
++    hid_device_set_button(iface, 10, (r->buttons >> 10) & 1);
++    hid_device_set_button(iface, 11, (r->buttons >> 13) & 1);
++    hid_device_set_button(iface, 12, (r->buttons >> 11) & 1);
++    hid_device_set_button(iface, 13, (r->buttons >> 12) & 1);
++    hid_device_set_hatswitch_x(iface, 0, ((r->buttons >> 13) & 1) - ((r->buttons >> 12) & 1));
++    hid_device_set_hatswitch_y(iface, 0, ((r->buttons >> 11) & 1) - ((r->buttons >> 10) & 1));
++    for (i = 0; i < 6; i++)
++    {
++        LONG v = r->axes[i];
++        if (i == 1 || i == 3) v = -v - 1; /* match XUSB / GIP protocol */
++        hid_device_set_abs_axis(iface, i, v);
++    }
++    pad->buttons = r->buttons;
++    bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len);
++}
++
++static ULONGLONG pad_now_ms(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (ULONGLONG)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++}
++
++/* connects to the app (again) if needed; returns the socket or -1 */
++static int pad_connect(void)
++{
++    struct sockaddr_un addr;
++    socklen_t len;
++    size_t n = strlen(pad_socket);
++    int fd;
++
++    if (pad_fd >= 0) return pad_fd;
++    if (pad_now_ms() < pad_next_connect) return -1;
++    pad_next_connect = pad_now_ms() + 1000;
++    memset(&addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    if (pad_socket[0] == '@')
++    {
++        memcpy(addr.sun_path + 1, pad_socket + 1, n - 1);
++        len = offsetof(struct sockaddr_un, sun_path) + n;
++    }
++    else
++    {
++        memcpy(addr.sun_path, pad_socket, n);
++        len = offsetof(struct sockaddr_un, sun_path) + n + 1;
++    }
++    if ((fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0) return -1;
++    if (connect(fd, (struct sockaddr *)&addr, len) < 0)
++    {
++        close(fd);
++        return -1;
++    }
++    pthread_mutex_lock(&pad_cs);
++    pad_fd = fd;
++    pthread_mutex_unlock(&pad_cs);
++    pad_rx_len = 0;
++    TRACE("connected to %s\n", debugstr_a(pad_socket));
++    return fd;
++}
++
++static void pad_lost(void)
++{
++    int i;
++    pthread_mutex_lock(&pad_cs);
++    if (pad_fd >= 0) close(pad_fd);
++    pad_fd = -1;
++    pthread_mutex_unlock(&pad_cs);
++    for (i = 0; i < PMB_PAD_MAX; i++) pad_disconnected(i);
++}
++
+ NTSTATUS sdl_bus_init(void *args)
+ {
+-    WARN("SDL support not compiled in!\n");
+-    return STATUS_NOT_IMPLEMENTED;
++    const char *s = getenv("PMBOS_GAMEPAD_SOCKET");
++    if (!s || !*s || strlen(s) >= sizeof(pad_socket) || strlen(s) < 2)
++    {
++        WARN("SDL support not compiled in, no PMB OS gamepads\n");
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    strcpy(pad_socket, s);
++    if (pipe(pad_wake)) return STATUS_UNSUCCESSFUL;
++    pad_quit = 0;
++    return STATUS_SUCCESS;
+ }
+ 
+ NTSTATUS sdl_bus_wait(void *args)
+ {
+-    WARN("SDL support not compiled in!\n");
+-    return STATUS_NOT_IMPLEMENTED;
++    struct bus_event *result = args;
++
++    bus_event_cleanup(result);
++    while (!pad_quit)
++    {
++        struct pollfd pfd[2];
++        int fd, n;
++
++        if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;
++        fd = pad_connect();
++        pfd[0].fd = pad_wake[0];
++        pfd[0].events = POLLIN;
++        pfd[1].fd = fd;
++        pfd[1].events = POLLIN;
++        n = poll(pfd, fd >= 0 ? 2 : 1, fd >= 0 ? -1 : 1000);
++        if (n <= 0) continue;
++        if (pfd[0].revents) break;
++        if (fd >= 0 && pfd[1].revents)
++        {
++            ssize_t r = recv(fd, pad_rx + pad_rx_len, sizeof(pad_rx) - pad_rx_len, MSG_DONTWAIT);
++            if (r <= 0)
++            {
++                if (r < 0 && (errno == EAGAIN || errno == EINTR)) continue;
++                pad_lost();
++                continue;
++            }
++            pad_rx_len += r;
++            if (pad_rx_len == sizeof(pad_rx))
++            {
++                struct pmb_pad_record rec;
++                memcpy(&rec, pad_rx, sizeof(rec));
++                pad_rx_len = 0;
++                if (rec.type == 1) pad_connected(rec.id);
++                else if (rec.type == 2) pad_disconnected(rec.id);
++                else if (rec.type == 3) pad_state(&rec);
++            }
++        }
++    }
++    TRACE("PMB OS gamepad loop exiting\n");
++    pad_lost();
++    bus_event_queue_destroy(&event_queue);
++    return STATUS_SUCCESS;
+ }
+ 
+ NTSTATUS sdl_bus_stop(void *args)
+ {
+-    WARN("SDL support not compiled in!\n");
+-    return STATUS_NOT_IMPLEMENTED;
++    pad_quit = 1;
++    if (pad_wake[1] >= 0) write(pad_wake[1], "q", 1);
++    return STATUS_SUCCESS;
+ }
+ 
+ #endif /* SONAME_LIBSDL2 */

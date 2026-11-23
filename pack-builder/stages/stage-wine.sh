@@ -38,6 +38,10 @@ for v in $build_versions; do
         log "wine $v: applying $(basename "$pf")"
         (cd "$w/src" && patch -p1 --fuzz=0 < "$pf")
     done
+    # TinySoundFont for the MIDI synthesizer of wine-*-pmbos-midi-synth.patch (MIT, vendored in src/third_party)
+    if [ -f "$w/src/dlls/winealsa.drv/alsamidi.c" ] && grep -q '"tsf.h"' "$w/src/dlls/winealsa.drv/alsamidi.c"; then
+        cp "$PB/src/third_party/tsf.h" "$w/src/dlls/winealsa.drv/tsf.h"
+    fi
 
     log "wine $v: configure"
     (
@@ -52,7 +56,7 @@ for v in $build_versions; do
             --with-xcomposite --with-xcursor --with-xfixes --with-xinerama --with-xinput2 \
             --with-xrandr --with-xrender --with-xshape --with-xshm --with-xxf86vm \
             --without-capi --without-cups --without-dbus --without-ffmpeg --without-gphoto \
-            --without-gssapi --without-gstreamer --without-hwloc --without-krb5 --without-netapi \
+            --without-gssapi --with-gstreamer --without-hwloc --without-krb5 --without-netapi \
             --without-opencl --without-oss --without-pcap --without-pcsclite --without-sane \
             --without-sdl --without-udev --without-unwind --without-usb --without-v4l2 \
             --without-wayland \
