@@ -20,6 +20,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stddef.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 
 static int failures;
 static const char *dir;
@@ -195,6 +200,34 @@ int main(int argc, char **argv) {
     CHECK(shmat(-1, NULL, 0) == (void *)-1 && errno == EINVAL);
     CHECK(shmctl(999999, IPC_RMID, NULL) == -1 && errno == EINVAL);
     CHECK(shmctl(1, 4242, &ds) == -1 && errno == EINVAL);
+
+    /* 12. a seccomp-trapped syscall returns ENOSYS instead of killing the process (as under the Android app
+     * policy). Done in a child: the filter cannot be removed again. Skipped where no filter can be installed
+     * (qemu-user). */
+#if defined(__aarch64__)
+    {
+        pid_t pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            struct sock_filter f[] = {
+                BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_get_mempolicy, 0, 1),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            };
+            struct sock_fprog prog = {(unsigned short)(sizeof(f) / sizeof(f[0])), f};
+            if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 || prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0)
+                _exit(77);
+            errno = 0;
+            long r = syscall(__NR_get_mempolicy, NULL, NULL, 0UL, NULL, 0UL);
+            _exit(r == -1 && errno == ENOSYS ? 0 : 1);
+        }
+        int st = 0;
+        CHECK(waitpid(pid, &st, 0) == pid);
+        if (WIFEXITED(st) && WEXITSTATUS(st) == 77) printf("pmbshm-test: seccomp unavailable here, SIGSYS check skipped\n");
+        else CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+#endif
 
     if (failures) {
         fprintf(stderr, "pmbshm-test: %d failure(s)\n", failures);

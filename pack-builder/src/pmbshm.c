@@ -227,8 +227,73 @@ static int grow(void **arr, size_t *cap, size_t elem) {
     return 0;
 }
 
+/* ---------------------------------------------------------------------------------------
+ * Seccomp traps
+ *
+ * The Android app seccomp policy answers some syscalls with SIGSYS, which kills the process
+ * by default. Native libraries reached from Windows programs call a few of them through
+ * glibc's generic syscall() (libnuma's get_mempolicy (236), pulled in by the x265/SVT-AV1
+ * parts of libavcodec, killed every video decoder). On a normal Linux system without such a
+ * syscall the kernel answers -ENOSYS and every caller copes with that, so a trapped syscall
+ * returns -ENOSYS here instead. Each syscall number is reported once on stderr.
+ * Only SYS_SECCOMP traps are handled; a program that installs its own SIGSYS handler later
+ * replaces this one.
+ * ------------------------------------------------------------------------------------- */
+#if defined(__aarch64__)
+#include <signal.h>
+#include <ucontext.h>
+
+#ifndef SYS_SECCOMP
+#define SYS_SECCOMP 1
+#endif
+
+static volatile unsigned char g_sigsys_seen[1024];
+
+static void sigsys_put(const char *s) {
+    ssize_t r = write(2, s, strlen(s));
+    (void)r;
+}
+
+static void sigsys_handler(int sig, siginfo_t *si, void *ucv) {
+    (void)sig;
+    ucontext_t *uc = ucv;
+    if (si->si_code != SYS_SECCOMP) return;
+    int saved = errno;
+    unsigned nr = (unsigned)si->si_syscall;
+    if (nr >= sizeof(g_sigsys_seen) || !g_sigsys_seen[nr]) {
+        if (nr < sizeof(g_sigsys_seen)) g_sigsys_seen[nr] = 1;
+        char num[16];
+        int i = (int)sizeof(num) - 1;
+        num[i] = 0;
+        unsigned v = nr;
+        do { num[--i] = (char)('0' + v % 10); v /= 10; } while (v && i > 0);
+        sigsys_put("pmbshm: syscall ");
+        sigsys_put(num + i);
+        sigsys_put(" is not allowed for Android apps, returning ENOSYS\n");
+    }
+    uc->uc_mcontext.regs[0] = (unsigned long long)(long long)-ENOSYS;
+    errno = saved;
+}
+
+static void install_sigsys(void) {
+    struct sigaction old;
+    if (sigaction(SIGSYS, NULL, &old) == 0 && (old.sa_flags & SA_SIGINFO ? old.sa_sigaction != NULL
+                                                                         : old.sa_handler != SIG_DFL))
+        return; /* someone already handles it */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = sigsys_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSYS, &sa, NULL);
+}
+#else
+static void install_sigsys(void) {}
+#endif
+
 __attribute__((constructor)) static void pmbshm_ctor(void) {
     pthread_atfork(atfork_prepare, atfork_parent, atfork_child);
+    install_sigsys();
 }
 
 /* Deferred IPC_RMID unlinks that are still outstanding when the process exits. */
