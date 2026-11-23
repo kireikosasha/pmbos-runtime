@@ -12,7 +12,7 @@
 #   -u, --base-url URL    public base URL of the archives (written into index.json), e.g.
 #                         https://github.com/<owner>/<repo>/releases/download/runtime-1.0.0
 #   -s, --stages LIST     comma separated subset of:
-#                         images,fetch,pmbshm,libxcb,glibc,rootfs,box64,wine,mesa,mesa-sw,repack,post,verify,index
+#                         images,fetch,pmbshm,pmbaudio,libxcb,glibc,rootfs,box64,wine,mesa,mesa-sw,repack,post,verify,index
 #   -p, --packs "IDS"     only (re)finalize these staged pack ids in the post stage
 #   -j, --jobs N          parallel build jobs (default: nproc)
 #       --no-verify       skip the verify stage
@@ -28,7 +28,7 @@ PB_LOG_PREFIX=build-all
 # shellcheck source=versions.env
 . "$PB_HOST/versions.env"
 
-ALL_STAGES="images,fetch,pmbshm,libxcb,glibc,rootfs,box64,wine,mesa,mesa-sw,repack,post,verify,index"
+ALL_STAGES="images,fetch,pmbshm,pmbaudio,libxcb,glibc,rootfs,box64,wine,mesa,mesa-sw,repack,post,verify,index"
 WORK_HOST="$PB_HOST/out"
 BASE_URL="${BASE_URL:-}"
 STAGES="$ALL_STAGES"
@@ -162,6 +162,7 @@ if want images; then
 fi
 want fetch  && run_stage tools fetch
 want pmbshm && run_stage arm64 pmbshm
+want pmbaudio && run_stage arm64 pmbaudio
 want libxcb && run_stage arm64 libxcb
 want glibc  && run_stage arm64 glibc
 # shellcheck disable=SC2086

@@ -16,6 +16,7 @@ trap 'fix_owner "$raw" "$root" "$STAGE"' EXIT
 need_cmd mmdebstrap python3 zcat
 
 [ -f "$BUILD/pmbshm/libpmbshm.so" ] || die "run stage pmbshm first"
+[ -f "$BUILD/pmbaudio/libasound_module_pcm_pmbos.so" ] || die "run stage pmbaudio first"
 [ -f "$BUILD/libxcb/LIBFILE" ] || die "run stage libxcb first"
 libxcb_file="$(cat "$BUILD/libxcb/LIBFILE")"
 [ -f "$BUILD/glibc/VERSION" ] && [ -d "$BUILD/glibc/overlay" ] || die "run stage glibc first"
@@ -135,8 +136,11 @@ dest_xcb="usr/lib/aarch64-linux-gnu/$libxcb_file"
 [ -f "$dest_xcb" ] || die "Debian libxcb file $dest_xcb not found (version drift?)"
 install -m 0644 "$BUILD/libxcb/$libxcb_file" "$dest_xcb"
 install -m 0644 "$BUILD/pmbshm/libpmbshm.so" usr/lib/libpmbshm.so
+# the sound device: ALSA PCM plugin "pmbos" (the launcher's asound.conf names this file; AudioServer.java)
+[ -e "usr/lib/$TRIPLET/libasound.so.2" ] || die "libasound.so.2 missing (ROOTFS_OPTIONAL_PACKAGES must contain libasound2)"
+install -D -m 0644 "$BUILD/pmbaudio/libasound_module_pcm_pmbos.so" "usr/lib/$TRIPLET/alsa-lib/libasound_module_pcm_pmbos.so"
 printf '%s\n' "PMB OS imagefs $PACKSET_VERSION" "debian $DEBIAN_SUITE ($(date -u -d "@$SOURCE_DATE_EPOCH" +%F))" \
-    "glibc $glibc_ver + pmbos-rootfs + pmbos-execve" "libxcb $debver + pmbos-tmpdir" > etc/pmbos-release
+    "glibc $glibc_ver + pmbos-rootfs + pmbos-execve" "libxcb $debver + pmbos-tmpdir" "alsa pcm plugin pmbos" > etc/pmbos-release
 
 cd /
 packdef imagefs "$DEBIAN_SUITE-$PACKSET_VERSION" rootfs imagefs "" 1 1 \

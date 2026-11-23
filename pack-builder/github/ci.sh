@@ -360,6 +360,7 @@ cmd_sources() {
         echo "          bundled there: opt/mesa-sw-$MESA_VERSION/share/BUILDINFO.mesa-sw.txt + share/doc/ in that pack)"
         echo "          source: https://snapshot.debian.org/package/llvm-toolchain-15/"
         echo "libpmbshm $PACKSET_VERSION  part of this builder: builder/src/pmbshm.c"
+        echo "libasound_module_pcm_pmbos $PACKSET_VERSION  part of this builder: builder/src/pmbaudio.c  LGPL-2.1-or-later"
         echo
         echo "== Redistributed unmodified upstream binaries (repacked) =="
         echo "DXVK          $DXVK_VERSION  zlib/libpng  $DXVK_URL"

@@ -211,7 +211,7 @@ jobs:
         run: bash "$CI_SH" restore
       - name: Stages pmbshm, libxcb, glibc (pinned, PMBOS_ROOTFS + execve patches), rootfs
         if: steps.reuse.outputs.hit != 'true'
-        run: bash "$BUILD_ALL" -w "$PB_WORK" -s pmbshm,libxcb,glibc,rootfs
+        run: bash "$BUILD_ALL" -w "$PB_WORK" -s pmbshm,pmbaudio,libxcb,glibc,rootfs
       - name: List imagefs Debian packages (for SOURCES.txt)
         if: steps.reuse.outputs.hit != 'true'
         run: bash "$CI_SH" imagefs-manifest
@@ -238,7 +238,7 @@ jobs:
       - name: Pack results
         if: steps.reuse.outputs.hit != 'true'
         run: >-
-          bash "$CI_SH" save pb-imagefs build/pmbshm build/libxcb build/glibc build/manifest
+          bash "$CI_SH" save pb-imagefs build/pmbshm build/pmbaudio build/libxcb build/glibc build/manifest
           stage/imagefs stage/imagefs.pack.json
       - uses: actions/upload-artifact@v4
         with:

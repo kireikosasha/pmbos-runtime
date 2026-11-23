@@ -53,6 +53,14 @@ run_clean env PMBOS_SHM_DIR="$shm" "$fs/lib/ld-linux-aarch64.so.1" --library-pat
     --preload "$fs/usr/lib/libpmbshm.so" "$BUILD/pmbshm/pmbshm-test" "$shm" \
     || die "libpmbshm self-test failed inside the installed imagefs"
 
+log "ALSA plugin self-test under the imagefs loader (imagefs libasound)"
+[ -x "$BUILD/pmbaudio/pmbaudio-test" ] || die "run stage pmbaudio first (self-test binary missing)"
+plugin="$fs/usr/lib/aarch64-linux-gnu/alsa-lib/libasound_module_pcm_pmbos.so"
+[ -f "$plugin" ] || die "imagefs has no ALSA plugin ($plugin)"
+snd="$(mktemp -d)"
+run_clean "$fs/lib/ld-linux-aarch64.so.1" --library-path "$libpath" "$BUILD/pmbaudio/pmbaudio-test" "$plugin" "$snd"     || die "ALSA plugin self-test failed inside the installed imagefs"
+rm -rf "$snd"
+
 log "imagefs glibc: PMBOS_ROOTFS relocation"
 grep -q PMBOS_ROOTFS "$fs/usr/lib/aarch64-linux-gnu/libc.so.6" || die "imagefs libc.so.6 is not the PMBOS_ROOTFS build"
 out="$(run_clean env PMBOS_ROOTFS="$fs" "$fs/bin/sh" -c 'echo "sh:$PMBOS_ROOTFS"' 2>&1)" \
